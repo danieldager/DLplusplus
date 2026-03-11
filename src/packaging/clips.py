@@ -1,25 +1,59 @@
-"""Clip building — cluster VTC speech segments into ≤10-minute clips.
+"""Clip building — tile full audio files into ≤10-minute clips.
 
-The algorithm uses **VTC segments** (labelled speech: FEM/MAL/KCHI/OCH) as
-the primary signal for clip boundaries.  VAD segments are assigned to clips
-as supplementary metadata for comparison.
+ALL audio is preserved.  VAD and VTC segments are used only to find safe
+cut points (never cutting during speech or vocalisation).
 
-Steps:
+Algorithm
+---------
+1. **Plan** how many clips are needed: ``ceil(duration / max_clip_s)``.
+2. **Ideal clip length** = ``duration / n_clips`` (distributes evenly).
+3. **Walk** ideal boundaries adaptively. For each one:
+   a. Build a search window ``[ideal_pos − search, ideal_pos + search]``
+      clamped to ``[prev_boundary, prev_boundary + max_clip_s]`` so the
+      hard limit is never exceeded.
+   b. Select a cut point using a **6-tier fallback chain** (see
+      ``CUT_TIERS`` and the ``_find_cut`` nested function):
 
-1. **Filter** VTC segments shorter than *min_seg_s* (removes coughs, etc.).
-2. **Merge** nearby VTC segments within *max_gap* into contiguous regions.
-3. **Greedily pack** small regions into clips up to *max_clip_s*.
-4. **Split** regions longer than *max_clip_s* at the best VTC speaker
-   boundary or silence within a ±\ *split_search_s* window.
-5. **Buffer** clips with *buffer_s* of silence on each side, resolve
-   overlaps without exceeding the clip limit.
-6. **Assign** both VTC and VAD segments to each clip.
-7. **Filter** clips with less than *min_clip_speech_s* of VTC speech.
+      1. Long silence gap (≥ ``min_gap_s``) in VAD∪VTC union.
+      2. Any silence gap in VAD∪VTC union.
+      3. Gap in VAD-only mask (VTC still active).
+      4. Gap in VTC-only mask (VAD still active).
+      5. VTC speaker-change boundary (inside active audio).
+      6. Hard cut — no gaps or boundaries at all.
+
+      Within each tier the midpoint closest to the ideal position is
+      chosen to minimise cumulative drift.
+   c. Recompute ``ideal_step`` from the *remaining* audio after each
+      cut to keep clip lengths as uniform as possible.
+4. **Assign** VTC and VAD segments to each clip (clamped to boundaries).
+
+No audio is discarded — every second ends up in exactly one clip.
+
+The function returns both the clip list and a ``dict[str, int]`` of
+tier usage counts (see ``CUT_TIERS``) so callers can report cut-quality
+statistics.
 """
 
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass, field
+
+import numpy as np
+
+log = logging.getLogger(__name__)
+
+# Tier labels for cut-point statistics (order = priority)
+CUT_TIERS: tuple[str, ...] = (
+    "long_union_gap",     # 1. Long silence gap (≥ min_gap_s) in VAD∪VTC union
+    "short_union_gap",    # 2. Any silence gap in VAD∪VTC union
+    "vad_only_gap",       # 3. Gap in VAD-only mask (VTC still active)
+    "vtc_only_gap",       # 4. Gap in VTC-only mask (VAD still active)
+    "speaker_boundary",   # 5. VTC speaker-change boundary (inside active audio)
+    "hard_cut",           # 6. No gaps or boundaries — forced cut
+    "degenerate_window",  # 0. Degenerate search window — forced cut
+)
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +63,7 @@ from dataclasses import dataclass, field
 
 @dataclass
 class Segment:
-    """A single continuous speech segment (absolute seconds)."""
+    """A single continuous speech/vocalisation segment (absolute seconds)."""
 
     onset: float
     offset: float
@@ -44,7 +78,7 @@ def _compute_iou(segs_a: list[Segment], segs_b: list[Segment],
                  clip_onset: float, clip_offset: float) -> float:
     """Compute frame-level IoU between two segment lists within a clip.
 
-    Uses 0.1s resolution for efficiency.
+    Uses 0.1 s resolution for efficiency.
     """
     dur = clip_offset - clip_onset
     if dur <= 0:
@@ -82,6 +116,9 @@ class Clip:
     # Segments (absolute coords — will be made relative at export)
     vad_segments: list[Segment] = field(default_factory=list)
     vtc_segments: list[Segment] = field(default_factory=list)
+    # SNR (set after clip building, from file-level pooled Brouhaha SNR)
+    snr_array: np.ndarray | None = field(default=None, repr=False)
+    snr_step_s: float = 1.0
 
     @property
     def duration(self) -> float:
@@ -96,11 +133,6 @@ class Clip:
     def vad_speech_duration(self) -> float:
         """Total VAD speech within this clip."""
         return sum(s.duration for s in self.vad_segments)
-
-    # Keep backward compat — "speech" now means VTC
-    @property
-    def speech_duration(self) -> float:
-        return self.vtc_speech_duration
 
     @property
     def speech_density(self) -> float:
@@ -162,6 +194,89 @@ class Clip:
             return 0.0
         return sum(s.duration for s in self.vtc_segments) / len(self.vtc_segments)
 
+    # --- SNR properties ---
+
+    @property
+    def snr_mean(self) -> float | None:
+        """Mean SNR across the clip (dB), or None if SNR not available."""
+        if self.snr_array is None or len(self.snr_array) == 0:
+            return None
+        return float(np.mean(self.snr_array, dtype=np.float32))
+
+    @property
+    def snr_std(self) -> float | None:
+        """Standard deviation of SNR across the clip (dB)."""
+        if self.snr_array is None or len(self.snr_array) == 0:
+            return None
+        return float(np.std(self.snr_array, dtype=np.float32))
+
+    @property
+    def snr_min(self) -> float | None:
+        """Minimum SNR value in the clip (dB)."""
+        if self.snr_array is None or len(self.snr_array) == 0:
+            return None
+        return float(np.min(self.snr_array))
+
+    @property
+    def snr_max(self) -> float | None:
+        """Maximum SNR value in the clip (dB)."""
+        if self.snr_array is None or len(self.snr_array) == 0:
+            return None
+        return float(np.max(self.snr_array))
+
+    # --- Per-label properties ---
+
+    @property
+    def label_durations(self) -> dict[str, float]:
+        """Total speech duration per VTC label."""
+        ld: dict[str, float] = {}
+        for s in self.vtc_segments:
+            if s.label:
+                ld[s.label] = ld.get(s.label, 0.0) + s.duration
+        return ld
+
+    @property
+    def child_speech_duration(self) -> float:
+        """Total KCHI + OCH speech in this clip."""
+        ld = self.label_durations
+        return ld.get("KCHI", 0.0) + ld.get("OCH", 0.0)
+
+    @property
+    def adult_speech_duration(self) -> float:
+        """Total FEM + MAL speech in this clip."""
+        ld = self.label_durations
+        return ld.get("FEM", 0.0) + ld.get("MAL", 0.0)
+
+    @property
+    def child_fraction(self) -> float:
+        """Fraction of VTC speech that is child (KCHI + OCH)."""
+        total = self.vtc_speech_duration
+        return self.child_speech_duration / total if total > 0 else 0.0
+
+    @property
+    def dominant_label(self) -> str | None:
+        """VTC label with the most speech in this clip."""
+        ld = self.label_durations
+        return max(ld, key=lambda k: ld[k]) if ld else None
+
+    def vad_coverage_by_label(self) -> dict[str, float]:
+        """For each VTC label, fraction of that label's time covered by VAD."""
+        result: dict[str, float] = {}
+        for label in self.labels_present:
+            label_segs = [s for s in self.vtc_segments if s.label == label]
+            total_dur = sum(s.duration for s in label_segs)
+            if total_dur == 0:
+                continue
+            covered = 0.0
+            for ls in label_segs:
+                for vs in self.vad_segments:
+                    ov_start = max(ls.onset, vs.onset)
+                    ov_end = min(ls.offset, vs.offset)
+                    if ov_end > ov_start:
+                        covered += ov_end - ov_start
+            result[label] = min(covered / total_dur, 1.0)
+        return result
+
     def to_metadata(self, uid: str, clip_idx: int) -> dict:
         """Serialise to a JSON-friendly dict with **relative** timestamps."""
         return {
@@ -181,12 +296,29 @@ class Clip:
             "n_labels": self.n_labels,
             "labels_present": self.labels_present,
             "has_adult": self.has_adult,
+            # Per-label
+            "child_speech_duration": round(self.child_speech_duration, 3),
+            "adult_speech_duration": round(self.adult_speech_duration, 3),
+            "child_fraction": round(self.child_fraction, 3),
+            "dominant_label": self.dominant_label,
+            "label_durations": {k: round(v, 3) for k, v in self.label_durations.items()},
+            "vad_coverage_by_label": {k: round(v, 3) for k, v in self.vad_coverage_by_label().items()},
             # VAD stats
             "vad_speech_duration": round(self.vad_speech_duration, 3),
             "vad_speech_density": round(self.vad_density, 3),
             "n_vad_segments": len(self.vad_segments),
             # Agreement
             "vad_vtc_iou": round(self.vad_vtc_iou, 3),
+            # SNR (from Brouhaha)
+            "snr_mean": round(self.snr_mean, 1) if self.snr_mean is not None else None,
+            "snr_std": round(self.snr_std, 1) if self.snr_std is not None else None,
+            "snr_min": round(self.snr_min, 1) if self.snr_min is not None else None,
+            "snr_max": round(self.snr_max, 1) if self.snr_max is not None else None,
+            "snr_step_s": self.snr_step_s if self.snr_array is not None else None,
+            "snr": (
+                [round(float(v), 1) for v in self.snr_array]
+                if self.snr_array is not None else None
+            ),
             # Segment details (relative timestamps)
             "vad_segments": [
                 {
@@ -213,59 +345,66 @@ class Clip:
 # ---------------------------------------------------------------------------
 
 
-def _merge_segments(
-    segs: list[Segment], max_gap: float
-) -> list[tuple[float, float, list[Segment]]]:
-    """Merge segments whose gap ≤ *max_gap* into contiguous regions.
+def _build_activity_union(
+    vtc_segments: list[Segment],
+    vad_segments: list[Segment],
+) -> list[Segment]:
+    """Merge all VAD + VTC segments into sorted, non-overlapping intervals.
 
-    Returns ``[(region_onset, region_offset, [original_segments]), ...]``
-    in chronological order.
+    The result represents all times where audio is "active" (speech or
+    vocalisation) — cutting here should be avoided.
     """
-    if not segs:
+    all_segs = [(s.onset, s.offset) for s in vtc_segments] + \
+               [(s.onset, s.offset) for s in vad_segments]
+    if not all_segs:
         return []
-    segs = sorted(segs, key=lambda s: s.onset)
-    regions: list[tuple[float, float, list[Segment]]] = []
-    cur_on, cur_off = segs[0].onset, segs[0].offset
-    cur_segs: list[Segment] = [segs[0]]
-    for s in segs[1:]:
-        if s.onset - cur_off <= max_gap:
-            cur_off = max(cur_off, s.offset)
-            cur_segs.append(s)
+
+    all_segs.sort()
+    merged: list[tuple[float, float]] = [all_segs[0]]
+    for on, off in all_segs[1:]:
+        prev_on, prev_off = merged[-1]
+        if on <= prev_off:
+            merged[-1] = (prev_on, max(prev_off, off))
         else:
-            regions.append((cur_on, cur_off, cur_segs))
-            cur_on, cur_off = s.onset, s.offset
-            cur_segs = [s]
-    regions.append((cur_on, cur_off, cur_segs))
-    return regions
+            merged.append((on, off))
+
+    return [Segment(onset=on, offset=off) for on, off in merged]
 
 
 def _find_silence_gaps(
-    segs: list[Segment],
+    active: list[Segment],
     search_start: float,
     search_end: float,
 ) -> list[tuple[float, float]]:
     """Find silence gaps within [search_start, search_end].
 
-    Returns ``[(gap_onset, gap_offset), ...]`` sorted by gap duration
-    (longest first).
+    *active* must be sorted and non-overlapping (output of
+    ``_build_activity_union``).
+
+    Returns ``[(gap_onset, gap_offset), ...]`` sorted longest-first.
     """
     relevant = sorted(
-        [s for s in segs if s.offset > search_start and s.onset < search_end],
+        [s for s in active if s.offset > search_start and s.onset < search_end],
         key=lambda s: s.onset,
     )
     if not relevant:
         return [(search_start, search_end)]
 
     gaps: list[tuple[float, float]] = []
-    if relevant[0].onset > search_start:
-        gaps.append((search_start, relevant[0].onset))
+    # Gap before first active segment
+    edge = max(relevant[0].onset, search_start)
+    if edge > search_start:
+        gaps.append((search_start, edge))
+    # Gaps between active segments
     for i in range(len(relevant) - 1):
-        g_on = relevant[i].offset
-        g_off = relevant[i + 1].onset
+        g_on = max(relevant[i].offset, search_start)
+        g_off = min(relevant[i + 1].onset, search_end)
         if g_off > g_on:
             gaps.append((g_on, g_off))
-    if relevant[-1].offset < search_end:
-        gaps.append((relevant[-1].offset, search_end))
+    # Gap after last active segment
+    edge = min(relevant[-1].offset, search_end)
+    if edge < search_end:
+        gaps.append((edge, search_end))
 
     return sorted(gaps, key=lambda g: g[1] - g[0], reverse=True)
 
@@ -275,11 +414,7 @@ def _vtc_speaker_boundaries(
     search_start: float,
     search_end: float,
 ) -> list[float]:
-    """Find points where a VTC speaker segment ends within the window.
-
-    Returns timestamps sorted by proximity to the window center (best
-    split points first).
-    """
+    """VTC segment boundaries within the window, closest to centre first."""
     center = (search_start + search_end) / 2
     boundaries: list[float] = []
     for s in vtc_segs:
@@ -295,179 +430,200 @@ def _vtc_speaker_boundaries(
 # ---------------------------------------------------------------------------
 
 
-def _split_long_region(
-    region_on: float,
-    region_off: float,
-    vtc_segs: list[Segment],
-    max_clip_s: float,
-    split_search_s: float,
-) -> list[tuple[float, float]]:
-    """Split a region longer than *max_clip_s* into sub-clip boundaries.
-
-    Strategy (uses VTC segments for both split heuristics):
-      1. Prefer VTC silence gap midpoint (longest gap in search window).
-      2. Then VTC speaker boundary (closest to window center).
-      3. Hard cut at max_clip_s.
-    """
-    clips: list[tuple[float, float]] = []
-    pos = region_on
-
-    while pos < region_off:
-        remaining = region_off - pos
-        if remaining <= max_clip_s + split_search_s:
-            clips.append((pos, region_off))
-            break
-
-        window_start = pos + max_clip_s - split_search_s
-        window_end = min(pos + max_clip_s + split_search_s, region_off)
-
-        # 1. Try VTC silence gap midpoint
-        silence_gaps = _find_silence_gaps(vtc_segs, window_start, window_end)
-        if silence_gaps:
-            gap = silence_gaps[0]
-            split_at = (gap[0] + gap[1]) / 2
-            clips.append((pos, split_at))
-            pos = split_at
-            continue
-
-        # 2. Try VTC speaker boundary
-        boundaries = _vtc_speaker_boundaries(vtc_segs, window_start, window_end)
-        if boundaries:
-            split_at = boundaries[0]
-            clips.append((pos, split_at))
-            pos = split_at
-            continue
-
-        # 3. Hard cut
-        split_at = pos + max_clip_s
-        clips.append((pos, split_at))
-        pos = split_at
-
-    return clips
-
-
 def build_clips(
     vtc_segments: list[Segment],
     vad_segments: list[Segment] | None = None,
     file_duration: float = 0.0,
     max_clip_s: float = 600.0,
-    buffer_s: float = 5.0,
-    max_gap: float = 10.0,
     split_search_s: float = 120.0,
-    min_clip_speech_s: float = 5.0,
-    min_seg_s: float = 0.5,
-) -> list[Clip]:
-    """Build clips from a single file's VTC + VAD segments.
+    min_gap_s: float = 10.0,
+) -> tuple[list[Clip], dict[str, int]]:
+    """Tile a full audio file into clips of roughly equal length.
 
-    VTC segments drive the clip boundaries.  VAD segments are assigned
-    to clips as supplementary metadata.
+    Every second of ``[0, file_duration]`` ends up in exactly one clip.
+    The number of clips is ``ceil(file_duration / max_clip_s)``, so the
+    ideal clip length is ``file_duration / n_clips``.  Cut points are
+    placed in the longest silence gap within a search window around
+    each ideal boundary.
 
     Parameters
     ----------
     vtc_segments : list[Segment]
-        VTC labelled segments (absolute seconds).  **Primary signal.**
+        VTC labelled segments (absolute seconds).
     vad_segments : list[Segment] | None
-        VAD speech segments (absolute seconds).  Optional — for comparison.
+        VAD speech segments (absolute seconds).  Optional.
     file_duration : float
         Total audio file duration in seconds.
     max_clip_s : float
-        Maximum clip duration (default 600 = 10 minutes).
-    buffer_s : float
-        Non-speech padding on each side of a clip.
-    max_gap : float
-        Maximum silence gap between VTC segments before they're split
-        into separate regions (default 10s).
+        Hard maximum clip duration (default 600 = 10 minutes).
     split_search_s : float
-        How far before/after the max_clip_s boundary to search for
-        a good split point (default 120 = 2 minutes).
-    min_clip_speech_s : float
-        Discard clips with less VTC speech than this.
-    min_seg_s : float
-        Filter out VTC segments shorter than this (removes coughs,
-        vocalizations, etc.).  Default 0.5s.
+        How far before/after the ideal boundary to search for a good
+        cut point (default 120 = 2 minutes).
+    min_gap_s : float
+        Silence gaps ≥ this length are strongly preferred (default 10 s).
 
     Returns
     -------
-    list[Clip]
-        Clips sorted by abs_onset, each with VTC and VAD segments attached.
+    (clips, tier_counts) : tuple[list[Clip], dict[str, int]]
+        *clips* — clips covering ``[0, file_duration]``, sorted
+        chronologically.  *tier_counts* — how many cuts used each
+        fallback tier (see ``CUT_TIERS``).
     """
+    tier_counts: dict[str, int] = {t: 0 for t in CUT_TIERS}
+
+    if file_duration <= 0:
+        return [], tier_counts
     if vad_segments is None:
         vad_segments = []
 
-    # --- Step 0: Filter short VTC segments ---
-    vtc_filtered = [s for s in vtc_segments if s.duration >= min_seg_s]
+    # --- Build activity masks ---
+    active = _build_activity_union(vtc_segments, vad_segments)
+    vad_only = _build_activity_union([], vad_segments)
+    vtc_only = _build_activity_union(vtc_segments, [])
 
-    if not vtc_filtered:
-        return []
+    # --- Plan: how many clips? ---
+    n_clips = max(1, math.ceil(file_duration / max_clip_s))
 
-    # --- Step 1: Merge VTC segments into regions ---
-    regions = _merge_segments(vtc_filtered, max_gap)
+    if n_clips == 1:
+        # Whole file fits in one clip
+        clip = Clip(abs_onset=0.0, abs_offset=file_duration)
+        for s in vad_segments:
+            if s.offset > 0 and s.onset < file_duration:
+                clip.vad_segments.append(Segment(
+                    onset=max(s.onset, 0.0),
+                    offset=min(s.offset, file_duration),
+                ))
+        for s in vtc_segments:
+            if s.offset > 0 and s.onset < file_duration:
+                clip.vtc_segments.append(Segment(
+                    onset=max(s.onset, 0.0),
+                    offset=min(s.offset, file_duration),
+                    label=s.label,
+                ))
+        return [clip], tier_counts
 
-    # --- Step 2: Greedy packing into clips ---
-    raw_clips: list[tuple[float, float]] = []
+    # --- Place cut boundaries ---
+    boundaries: list[float] = [0.0]
 
-    i = 0
-    while i < len(regions):
-        r_on, r_off, _ = regions[i]
-        region_dur = r_off - r_on
+    def _find_cut(prev: float, ideal_pos: float) -> tuple[float, str]:
+        """Find best cut point near *ideal_pos*, respecting hard limit.
 
-        if region_dur > max_clip_s:
-            sub_clips = _split_long_region(
-                r_on, r_off, vtc_filtered,
-                max_clip_s, split_search_s,
+        Fallback chain
+        --------------
+        1. Long silence gap (≥ min_gap_s) in VAD∪VTC union → midpoint
+           closest to ideal.
+        2. Any silence gap in VAD∪VTC union → midpoint closest to ideal.
+        3. Gap in VAD-only mask (VTC may be active, but no speech
+           detected by VAD) → midpoint closest to ideal.
+        4. Gap in VTC-only mask (VAD may be active, but no labelled
+           speaker) → midpoint closest to ideal.
+        5. VTC speaker boundary closest to ideal (may land inside
+           active audio — logged as warning).
+        6. Hard cut at ideal position — no gap at all (logged as
+           warning).
+        """
+        window_start = max(ideal_pos - split_search_s, prev + 1.0)
+        window_end = min(ideal_pos + split_search_s, prev + max_clip_s,
+                         file_duration - 1.0)
+
+        if window_start >= window_end:
+            cut = min(prev + max_clip_s, file_duration)
+            log.warning(
+                "degenerate window at %.1fs (prev=%.1f, ideal=%.1f) — "
+                "forced cut",
+                cut, prev, ideal_pos,
             )
-            raw_clips.extend(sub_clips)
-            i += 1
-            continue
+            return cut, "degenerate_window"
 
-        # Try to pack subsequent regions into the same clip
-        clip_on = r_on
-        clip_off = r_off
-        j = i + 1
-        while j < len(regions):
-            next_on, next_off, _ = regions[j]
-            if next_off - clip_on > max_clip_s:
-                break
-            clip_off = next_off
-            j += 1
+        def _best_gap(gap_list):
+            """Pick gap whose midpoint is closest to ideal."""
+            if not gap_list:
+                return None
+            g = min(gap_list, key=lambda g: abs((g[0]+g[1])/2 - ideal_pos))
+            return (g[0] + g[1]) / 2
 
-        raw_clips.append((clip_on, clip_off))
-        i = j
+        # 1–2. Silence gap in full union (prefer long, then any)
+        gaps = _find_silence_gaps(active, window_start, window_end)
+        long_gaps = [(on, off) for on, off in gaps if off - on >= min_gap_s]
+        cut = _best_gap(long_gaps) if long_gaps else None
+        if cut is not None:
+            return cut, "long_union_gap"
+        cut = _best_gap(gaps)
+        if cut is not None:
+            return cut, "short_union_gap"
 
-    # --- Step 3: Add buffer, clamp to file bounds ---
-    buffered: list[tuple[float, float]] = []
-    for c_on, c_off in raw_clips:
-        b_on = max(0.0, c_on - buffer_s)
-        b_off = min(file_duration, c_off + buffer_s) if file_duration > 0 else c_off + buffer_s
-        buffered.append((b_on, b_off))
+        # 3. VAD-only gap (no VAD activity, even if VTC labels exist)
+        vad_gaps = _find_silence_gaps(vad_only, window_start, window_end)
+        cut = _best_gap(vad_gaps)
+        if cut is not None:
+            log.info(
+                "cut at %.1fs in VAD-only gap (VTC still active)",
+                cut,
+            )
+            return cut, "vad_only_gap"
 
-    # --- Step 4: Merge overlapping clips (buffers may cause overlap) ---
-    buffered.sort()
-    merged: list[tuple[float, float]] = [buffered[0]] if buffered else []
-    for c_on, c_off in buffered[1:]:
-        prev_on, prev_off = merged[-1]
-        if c_on < prev_off:
-            combined_off = max(prev_off, c_off)
-            if combined_off - prev_on <= max_clip_s:
-                merged[-1] = (prev_on, combined_off)
-            else:
-                mid = (c_on + prev_off) / 2
-                merged[-1] = (prev_on, mid)
-                merged.append((mid, c_off))
-        else:
-            merged.append((c_on, c_off))
+        # 4. VTC-only gap (no VTC labels, even if VAD detects speech)
+        vtc_gaps = _find_silence_gaps(vtc_only, window_start, window_end)
+        cut = _best_gap(vtc_gaps)
+        if cut is not None:
+            log.info(
+                "cut at %.1fs in VTC-only gap (VAD still active)",
+                cut,
+            )
+            return cut, "vtc_only_gap"
 
-    # --- Step 5: Assign segments to clips ---
+        # 5. VTC speaker boundary closest to ideal position
+        spk = _vtc_speaker_boundaries(vtc_segments, window_start, window_end)
+        if spk:
+            spk.sort(key=lambda t: abs(t - ideal_pos))
+            cut = spk[0]
+            log.warning(
+                "cut at %.1fs at speaker boundary inside active audio "
+                "[window %.1f–%.1f]",
+                cut, window_start, window_end,
+            )
+            return cut, "speaker_boundary"
+
+        # 6. Hard cut — no gaps, no boundaries at all
+        cut = min(ideal_pos, prev + max_clip_s)
+        log.warning(
+            "hard cut at %.1fs — continuous activity, no gaps or "
+            "boundaries in [%.1f–%.1f]",
+            cut, window_start, window_end,
+        )
+        return cut, "hard_cut"
+
+    # --- Place cut boundaries adaptively ---
+    # Keep splitting until the remaining audio fits in one clip.
+    # Each step recomputes ideal_step from remaining audio, so cuts
+    # always target an even distribution of the remaining duration.
+    boundaries: list[float] = [0.0]
+
+    while file_duration - boundaries[-1] > max_clip_s:
+        prev = boundaries[-1]
+        remaining = file_duration - prev
+        n_remaining = max(1, math.ceil(remaining / max_clip_s))
+        ideal_step = remaining / n_remaining
+        ideal_pos = prev + ideal_step
+        cut, tier = _find_cut(prev, ideal_pos)
+        tier_counts[tier] += 1
+        boundaries.append(cut)
+
+    boundaries.append(file_duration)
+
+    # --- Build Clip objects and assign segments ---
     clips: list[Clip] = []
-    for c_on, c_off in merged:
+    for i in range(len(boundaries) - 1):
+        c_on, c_off = boundaries[i], boundaries[i + 1]
         clip = Clip(abs_onset=c_on, abs_offset=c_off)
+
         for s in vad_segments:
             if s.offset > c_on and s.onset < c_off:
                 clip.vad_segments.append(Segment(
                     onset=max(s.onset, c_on),
                     offset=min(s.offset, c_off),
                 ))
-        for s in vtc_filtered:
+        for s in vtc_segments:
             if s.offset > c_on and s.onset < c_off:
                 clip.vtc_segments.append(Segment(
                     onset=max(s.onset, c_on),
@@ -476,7 +632,4 @@ def build_clips(
                 ))
         clips.append(clip)
 
-    # --- Step 6: Filter out clips with negligible speech ---
-    clips = [c for c in clips if c.vtc_speech_duration >= min_clip_speech_s]
-
-    return clips
+    return clips, tier_counts

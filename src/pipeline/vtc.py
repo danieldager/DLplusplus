@@ -42,6 +42,9 @@ from typing import Literal
 import polars as pl
 import torch
 
+from src.compat import patch_torchaudio
+patch_torchaudio()
+
 from segma.config import load_config
 from segma.config.base import Config
 from segma.models import Models
@@ -64,6 +67,7 @@ from src.core.thresholds import (
     apply_default_threshold_regions,
     find_best_threshold_regions,
 )
+from src.core.vad_processing import set_seeds
 from src.utils import (
     add_sample_argument,
     atomic_write_parquet,
@@ -107,7 +111,7 @@ def main(
     threshold_high: float = 0.9,
     threshold_step: float = 0.1,
     min_duration_on_s: float = 0.1,
-    min_duration_off_s: float = 0.1,
+    min_duration_off_s: float = 0.3,
     batch_size: int = 128,
     save_logits: bool = False,
     no_regions: bool = False,
@@ -116,6 +120,8 @@ def main(
     array_count: int | None = None,
     sample: int | float | None = None,
 ):
+    set_seeds(42)
+
     # use fixed threshold, disable sweep & logits
     fixed_threshold = threshold is not None
     if fixed_threshold:
@@ -599,8 +605,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--min_duration_off_s",
         type=float,
-        default=0.1,
-        help="Fill gaps shorter than this (default: 0.1s)",
+        default=0.3,
+        help="Merge same-label segments with gap < this (default: 0.3s)",
     )
     parser.add_argument(
         "--batch_size",

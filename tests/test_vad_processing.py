@@ -180,24 +180,22 @@ class TestVadErrorMetadata:
 
 @requires_tenvad
 class TestProcessFile:
-    def test_on_good_book_file(self, good_book_wavs: list[Path]):
-        """End-to-end test on a real short audio file."""
-        wav = good_book_wavs[0]
-        meta, segs = process_vad_file((wav, 256, 0.5))
+    def test_on_speech_file(self, speech_clean_wav: Path):
+        """End-to-end test on a real speech audio file."""
+        meta, segs = process_vad_file((speech_clean_wav, 256, 0.5))
         assert meta["success"] is True
         assert meta["duration"] > 0
-        assert meta["file_id"] == wav.stem
+        assert meta["file_id"] == speech_clean_wav.stem
         assert meta["speech_ratio"] >= 0.0
-        # Audiobook files should have detectable speech
+        # Real speech files should have detectable speech
         assert meta["n_speech_segments"] > 0
         for seg in segs:
             assert set(seg.keys()) == {"file_id", "onset", "offset", "duration"}
             assert seg["duration"] > 0
 
-    def test_on_short_fail_file(self, short_fail_wavs: list[Path]):
+    def test_on_short_file(self, short_wav: Path):
         """Short files should still process without error."""
-        wav = short_fail_wavs[0]
-        meta, segs = process_vad_file((wav, 256, 0.5))
+        meta, segs = process_vad_file((short_wav, 256, 0.5))
         assert meta["success"] is True
         assert meta["duration"] > 0
 

@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
-"""Package pipeline — build WebDataset shards from VTC + VAD outputs.
+"""Package pipeline — tile full audio files into WebDataset shards.
 
-Clips are built from **VTC segments** (the primary speech signal).
-VAD segments are assigned to each clip as supplementary metadata for
-comparison / agreement analysis.
+All audio is preserved.  VAD + VTC segments are used only to find safe
+cut points (never cutting during speech/vocalisation).
 
 Usage:
     python -m src.pipeline.package seedlings --sample 0.01
-    python -m src.pipeline.package seedlings --max_gap 10 --max_clip 600
+    python -m src.pipeline.package seedlings --max_clip 600
 """
 
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 import time
 from pathlib import Path
@@ -20,8 +20,10 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from src.packaging.clips import Clip, Segment, build_clips
+from src.core import LABEL_COLORS, VTC_LABELS
+from src.packaging.clips import CUT_TIERS, Clip, Segment, build_clips
 from src.packaging.writer import write_shards
+from src.plotting.packaging import save_figure, save_label_figures
 from src.utils import (
     add_sample_argument,
     get_dataset_paths,
@@ -75,13 +77,52 @@ def _get_file_duration(metadata_dir: Path, uid: str) -> float | None:
     return float(df["duration"][0])
 
 
+def _load_snr(
+    output_dir: Path, uid: str,
+) -> tuple[np.ndarray | None, float]:
+    """Load pooled SNR array for one file.
+
+    Returns ``(pooled_snr_float32, pool_step_s)`` or ``(None, 1.0)``
+    if the SNR file is not found.
+    """
+    snr_path = output_dir / "snr" / f"{uid}.npz"
+    if not snr_path.exists():
+        return None, 1.0
+    data = np.load(snr_path)
+    snr = data["snr"].astype(np.float32)
+    pool_step_s = float(data["pool_step_s"])
+    return snr, pool_step_s
+
+
+def _slice_snr_for_clip(
+    file_snr: np.ndarray,
+    pool_step_s: float,
+    abs_onset: float,
+    abs_offset: float,
+) -> np.ndarray:
+    """Slice file-level pooled SNR for one clip.
+
+    Returns a float16 array of SNR values covering the clip's time range.
+    Element *i* approximates the mean SNR over window
+    ``[clip_start + i*pool_step_s, clip_start + (i+1)*pool_step_s]``.
+    """
+    start_idx = int(abs_onset / pool_step_s)
+    end_idx = int(np.ceil(abs_offset / pool_step_s))
+    start_idx = max(0, min(start_idx, len(file_snr)))
+    end_idx = max(start_idx, min(end_idx, len(file_snr)))
+    return file_snr[start_idx:end_idx].astype(np.float16)
+
+
 # ---------------------------------------------------------------------------
 # Statistics
 # ---------------------------------------------------------------------------
 
 
-def _print_stats(clips: list[tuple[str, Path, int, Clip]]) -> dict:
-    """Print comprehensive clip statistics.  Returns stats dict for figure."""
+def _print_stats(
+    clips: list[tuple[str, Path, int, Clip]],
+    tier_counts: dict[str, int] | None = None,
+) -> dict:
+    """Print comprehensive clip statistics.  Returns stats dict for figures."""
     all_clips = [c for _, _, _, c in clips]
     n = len(all_clips)
 
@@ -92,18 +133,58 @@ def _print_stats(clips: list[tuple[str, Path, int, Clip]]) -> dict:
     vad_dens = np.array([c.vad_density for c in all_clips])
     ious = np.array([c.vad_vtc_iou for c in all_clips])
     turns = np.array([c.n_turns for c in all_clips])
-    n_labels = np.array([c.n_labels for c in all_clips])
+    n_labels_arr = np.array([c.n_labels for c in all_clips])
     has_adult = np.array([c.has_adult for c in all_clips])
+    child_fracs = np.array([c.child_fraction for c in all_clips])
+    dominant_labels = [c.dominant_label or "?" for c in all_clips]
 
-    # Per-segment stats (across all clips)
-    all_vtc_seg_durs = [s.duration for c in all_clips for s in c.vtc_segments]
-    all_vtc_gaps = []
+    # SNR per clip (optional — only present if Brouhaha pipeline was run)
+    snr_means_list = [c.snr_mean for c in all_clips if c.snr_mean is not None]
+    snr_stds_list = [c.snr_std for c in all_clips if c.snr_std is not None]
+    snr_mins_list = [c.snr_min for c in all_clips if c.snr_min is not None]
+    snr_maxs_list = [c.snr_max for c in all_clips if c.snr_max is not None]
+    snr_means = np.array(snr_means_list) if snr_means_list else np.array([])
+    snr_stds = np.array(snr_stds_list) if snr_stds_list else np.array([])
+    snr_mins = np.array(snr_mins_list) if snr_mins_list else np.array([])
+    snr_maxs = np.array(snr_maxs_list) if snr_maxs_list else np.array([])
+    has_snr_data = len(snr_means) > 0
+
+    # Per-label segment data
+    label_seg_durs: dict[str, list[float]] = {l: [] for l in VTC_LABELS}
+    label_seg_counts: dict[str, int] = {l: 0 for l in VTC_LABELS}
+    for c in all_clips:
+        for s in c.vtc_segments:
+            if s.label in VTC_LABELS:
+                label_seg_durs[s.label].append(s.duration)
+                label_seg_counts[s.label] += 1
+
+    # Per-label VAD coverage (per-clip)
+    label_vad_coverage: dict[str, list[float]] = {l: [] for l in VTC_LABELS}
+    for c in all_clips:
+        cov = c.vad_coverage_by_label()
+        for l in VTC_LABELS:
+            if l in cov:
+                label_vad_coverage[l].append(cov[l])
+
+    # Gap analysis: same-label vs cross-label
+    same_label_gaps: list[float] = []
+    cross_label_gaps: list[float] = []
+    gap_label_pairs: list[tuple[str, str, float]] = []
     for c in all_clips:
         segs = sorted(c.vtc_segments, key=lambda s: s.onset)
         for i in range(1, len(segs)):
             gap = segs[i].onset - segs[i - 1].offset
             if gap > 0:
-                all_vtc_gaps.append(gap)
+                l_from = segs[i - 1].label or "?"
+                l_to = segs[i].label or "?"
+                gap_label_pairs.append((l_from, l_to, gap))
+                if l_from == l_to:
+                    same_label_gaps.append(gap)
+                else:
+                    cross_label_gaps.append(gap)
+
+    all_vtc_seg_durs = [s.duration for c in all_clips for s in c.vtc_segments]
+    all_vtc_gaps = same_label_gaps + cross_label_gaps
 
     vtc_seg_durs = np.array(all_vtc_seg_durs) if all_vtc_seg_durs else np.array([0.0])
     vtc_gaps = np.array(all_vtc_gaps) if all_vtc_gaps else np.array([0.0])
@@ -119,6 +200,38 @@ def _print_stats(clips: list[tuple[str, Path, int, Clip]]) -> dict:
     print(f"\n  Clip duration (s):")
     print(f"    {_fmt(durations)}")
     print(f"    total = {durations.sum() / 3600:.1f}h")
+
+    # --- Cut-point tier breakdown ---
+    if tier_counts is not None:
+        total_cuts = sum(tier_counts.values())
+        if total_cuts > 0:
+            _tier_labels = {
+                "long_union_gap":    "1. Long silence gap (VAD∪VTC)",
+                "short_union_gap":   "2. Short silence gap (VAD∪VTC)",
+                "vad_only_gap":      "3. VAD-only gap (VTC active)",
+                "vtc_only_gap":      "4. VTC-only gap (VAD active)",
+                "speaker_boundary":  "5. Speaker boundary (active audio)",
+                "hard_cut":          "6. Hard cut (no gaps/boundaries)",
+                "degenerate_window": "⚠  Degenerate window (forced)",
+            }
+            print(f"\n  Cut-point tiers ({total_cuts} cuts):")
+            for tier_key, label in _tier_labels.items():
+                cnt = tier_counts.get(tier_key, 0)
+                if cnt > 0:
+                    pct = 100.0 * cnt / total_cuts
+                    print(f"    {label:44s} {cnt:>4d}  ({pct:5.1f}%)")
+            silent = (tier_counts.get("long_union_gap", 0)
+                      + tier_counts.get("short_union_gap", 0))
+            print(f"    {'─' * 55}")
+            print(f"    {'Clean (silence gap):':44s} {silent:>4d}  "
+                  f"({100.0 * silent / total_cuts:5.1f}%)")
+            degraded = (tier_counts.get("speaker_boundary", 0)
+                        + tier_counts.get("hard_cut", 0)
+                        + tier_counts.get("degenerate_window", 0))
+            if degraded:
+                print(f"    {'Degraded (boundary/hard/degen):':44s} "
+                      f"{degraded:>4d}  "
+                      f"({100.0 * degraded / total_cuts:5.1f}%)")
 
     print(f"\n  VTC speech per clip (s):")
     print(f"    {_fmt(vtc_durs)}")
@@ -137,11 +250,22 @@ def _print_stats(clips: list[tuple[str, Path, int, Clip]]) -> dict:
     print(f"\n  VAD–VTC agreement (IoU per clip):")
     print(f"    {_fmt(ious)}")
 
+    if has_snr_data:
+        print(f"\n  SNR per clip (dB) — mean:")
+        print(f"    {_fmt(snr_means)}")
+        print(f"  SNR per clip (dB) — intra-clip std:")
+        print(f"    {_fmt(snr_stds)}")
+        for thresh in (0, 5, 10, 15):
+            n_low = int((snr_means < thresh).sum())
+            pct = 100.0 * n_low / n
+            print(f"    clips with mean SNR < {thresh:>2d} dB: "
+                  f"{n_low:>4d} ({pct:.1f}%)")
+
     print(f"\n  Speaker turns per clip:")
     print(f"    {_fmt(turns.astype(float))}")
 
     print(f"\n  Labels per clip:")
-    print(f"    {_fmt(n_labels.astype(float))}")
+    print(f"    {_fmt(n_labels_arr.astype(float))}")
     print(f"    clips with adult (FEM/MAL): "
           f"{has_adult.sum()}/{n} ({has_adult.mean():.0%})")
 
@@ -153,6 +277,44 @@ def _print_stats(clips: list[tuple[str, Path, int, Clip]]) -> dict:
     print(f"    {_fmt(vtc_gaps)}")
     print(f"    total gaps: {len(all_vtc_gaps)}")
 
+    # --- Per-label stats ---
+    print(f"\n{'─' * 60}")
+    print(f"  PER-LABEL STATISTICS")
+    print(f"{'─' * 60}")
+    for l in VTC_LABELS:
+        durs = label_seg_durs[l]
+        if not durs:
+            print(f"\n  {l}: no segments")
+            continue
+        arr = np.array(durs)
+        total_h = arr.sum() / 3600
+        cov = label_vad_coverage[l]
+        cov_str = (f"  VAD coverage: mean={np.mean(cov):.2f}  std={np.std(cov):.2f}"
+                   if cov else "  VAD coverage: N/A")
+        print(f"\n  {l}: {label_seg_counts[l]} segments, {total_h:.2f}h total")
+        print(f"    segment duration: {_fmt(arr)}")
+        print(f"    {cov_str}")
+
+    # --- Gap analysis ---
+    print(f"\n{'─' * 60}")
+    print(f"  GAP ANALYSIS (same-label vs cross-label)")
+    print(f"{'─' * 60}")
+    sl_arr = np.array(same_label_gaps) if same_label_gaps else np.array([0.0])
+    cl_arr = np.array(cross_label_gaps) if cross_label_gaps else np.array([0.0])
+    print(f"\n  Same-label gaps ({len(same_label_gaps)}):")
+    print(f"    {_fmt(sl_arr)}")
+    print(f"\n  Cross-label gaps ({len(cross_label_gaps)}):")
+    print(f"    {_fmt(cl_arr)}")
+
+    # --- Child vs Adult ---
+    print(f"\n{'─' * 60}")
+    print(f"  CHILD vs ADULT")
+    print(f"{'─' * 60}")
+    print(f"\n  Child fraction per clip: {_fmt(child_fracs)}")
+    child_dom = sum(1 for d in dominant_labels if d in ("KCHI", "OCH"))
+    adult_dom = sum(1 for d in dominant_labels if d in ("FEM", "MAL"))
+    print(f"  Dominant label: child={child_dom}  adult={adult_dom}")
+
     print(f"{'═' * 60}\n")
 
     return {
@@ -163,119 +325,27 @@ def _print_stats(clips: list[tuple[str, Path, int, Clip]]) -> dict:
         "vad_dens": vad_dens,
         "ious": ious,
         "turns": turns,
-        "n_labels": n_labels,
+        "n_labels": n_labels_arr,
         "has_adult": has_adult,
         "vtc_seg_durs": vtc_seg_durs,
         "vtc_gaps": vtc_gaps,
+        "child_fracs": child_fracs,
+        "dominant_labels": dominant_labels,
+        "label_seg_durs": {l: np.array(d) if d else np.array([])
+                           for l, d in label_seg_durs.items()},
+        "label_seg_counts": label_seg_counts,
+        "label_vad_coverage": {l: np.array(d) if d else np.array([])
+                               for l, d in label_vad_coverage.items()},
+        "same_label_gaps": np.array(same_label_gaps) if same_label_gaps else np.array([]),
+        "cross_label_gaps": np.array(cross_label_gaps) if cross_label_gaps else np.array([]),
+        "gap_label_pairs": gap_label_pairs,
+        # SNR (empty arrays if SNR pipeline was not run)
+        "snr_means": snr_means,
+        "snr_stds": snr_stds,
+        "snr_mins": snr_mins,
+        "snr_maxs": snr_maxs,
+        "has_snr_data": has_snr_data,
     }
-
-
-def _save_figure(stats: dict, output_path: Path) -> None:
-    """Save a multi-panel summary figure."""
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    fig, axes = plt.subplots(3, 3, figsize=(16, 12))
-    fig.suptitle("Clip Packaging Summary", fontsize=14, fontweight="bold")
-
-    # 1. Clip duration distribution
-    ax = axes[0, 0]
-    ax.hist(stats["durations"], bins=40, color="#4C72B0", edgecolor="white", alpha=0.8)
-    ax.set_xlabel("Clip duration (s)")
-    ax.set_ylabel("Count")
-    ax.set_title("Clip Duration Distribution")
-    ax.axvline(np.median(stats["durations"]), color="red", ls="--", lw=1,
-               label=f'median={np.median(stats["durations"]):.0f}s')
-    ax.legend(fontsize=8)
-
-    # 2. VTC speech density
-    ax = axes[0, 1]
-    ax.hist(stats["vtc_dens"], bins=40, color="#55A868", edgecolor="white", alpha=0.8)
-    ax.set_xlabel("VTC speech density")
-    ax.set_ylabel("Count")
-    ax.set_title("VTC Speech Density")
-    ax.axvline(np.median(stats["vtc_dens"]), color="red", ls="--", lw=1,
-               label=f'median={np.median(stats["vtc_dens"]):.2f}')
-    ax.legend(fontsize=8)
-
-    # 3. VAD vs VTC density scatter
-    ax = axes[0, 2]
-    ax.scatter(stats["vtc_dens"], stats["vad_dens"], alpha=0.3, s=10, c="#C44E52")
-    ax.plot([0, 1], [0, 1], "k--", lw=0.5, alpha=0.5)
-    ax.set_xlabel("VTC density")
-    ax.set_ylabel("VAD density")
-    ax.set_title("VAD vs VTC Density")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-
-    # 4. IoU distribution
-    ax = axes[1, 0]
-    ax.hist(stats["ious"], bins=40, color="#8172B2", edgecolor="white", alpha=0.8)
-    ax.set_xlabel("VAD–VTC IoU")
-    ax.set_ylabel("Count")
-    ax.set_title("VAD–VTC Agreement (IoU)")
-    ax.axvline(np.median(stats["ious"]), color="red", ls="--", lw=1,
-               label=f'median={np.median(stats["ious"]):.2f}')
-    ax.legend(fontsize=8)
-
-    # 5. Turns per clip
-    ax = axes[1, 1]
-    max_turns = int(min(stats["turns"].max(), 50))
-    ax.hist(stats["turns"], bins=range(0, max_turns + 2), color="#CCB974",
-            edgecolor="white", alpha=0.8)
-    ax.set_xlabel("Speaker turns")
-    ax.set_ylabel("Count")
-    ax.set_title("Speaker Turns per Clip")
-    ax.axvline(np.median(stats["turns"]), color="red", ls="--", lw=1,
-               label=f'median={np.median(stats["turns"]):.0f}')
-    ax.legend(fontsize=8)
-
-    # 6. Labels per clip
-    ax = axes[1, 2]
-    ax.hist(stats["n_labels"], bins=range(0, 6), color="#64B5CD",
-            edgecolor="white", alpha=0.8, align="left")
-    ax.set_xlabel("Unique labels")
-    ax.set_ylabel("Count")
-    ax.set_title("Label Diversity per Clip")
-    ax.set_xticks(range(0, 5))
-
-    # 7. VTC segment duration
-    ax = axes[2, 0]
-    clipped = np.clip(stats["vtc_seg_durs"], 0, 30)
-    ax.hist(clipped, bins=60, color="#DD8452", edgecolor="white", alpha=0.8)
-    ax.set_xlabel("VTC segment duration (s, capped at 30)")
-    ax.set_ylabel("Count")
-    ax.set_title("VTC Segment Duration")
-    ax.axvline(np.median(stats["vtc_seg_durs"]), color="red", ls="--", lw=1,
-               label=f'median={np.median(stats["vtc_seg_durs"]):.1f}s')
-    ax.legend(fontsize=8)
-
-    # 8. Gap between VTC segments
-    ax = axes[2, 1]
-    clipped_gaps = np.clip(stats["vtc_gaps"], 0, 15)
-    ax.hist(clipped_gaps, bins=60, color="#DA8BC3", edgecolor="white", alpha=0.8)
-    ax.set_xlabel("Gap between VTC segments (s, capped at 15)")
-    ax.set_ylabel("Count")
-    ax.set_title("Inter-segment Gap")
-    ax.axvline(np.median(stats["vtc_gaps"]), color="red", ls="--", lw=1,
-               label=f'median={np.median(stats["vtc_gaps"]):.1f}s')
-    ax.legend(fontsize=8)
-
-    # 9. Speech duration vs clip duration
-    ax = axes[2, 2]
-    ax.scatter(stats["durations"], stats["vtc_durs"], alpha=0.3, s=10, c="#4C72B0")
-    ax.plot([0, stats["durations"].max()], [0, stats["durations"].max()],
-            "k--", lw=0.5, alpha=0.5)
-    ax.set_xlabel("Clip duration (s)")
-    ax.set_ylabel("VTC speech (s)")
-    ax.set_title("Speech vs Clip Duration")
-
-    plt.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-    print(f"  Figure: {output_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -284,6 +354,10 @@ def _save_figure(stats: dict, output_path: Path) -> None:
 
 
 def main() -> None:
+    logging.basicConfig(
+        format="%(levelname)s [%(name)s] %(message)s",
+        level=logging.WARNING,
+    )
     parser = argparse.ArgumentParser(
         description="Package audio clips into WebDataset tar shards.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -302,24 +376,8 @@ def main() -> None:
         help="Maximum clip duration in seconds (default: 600 = 10 min).",
     )
     parser.add_argument(
-        "--buffer", type=float, default=5.0,
-        help="Non-speech padding on each side (seconds, default: 5).",
-    )
-    parser.add_argument(
-        "--max_gap", type=float, default=10.0,
-        help="Max VTC silence gap before splitting regions (seconds, default: 10).",
-    )
-    parser.add_argument(
         "--split_search", type=float, default=120.0,
         help="Search window for finding split points (seconds, default: 120).",
-    )
-    parser.add_argument(
-        "--min_speech", type=float, default=5.0,
-        help="Discard clips with less VTC speech than this (seconds, default: 5).",
-    )
-    parser.add_argument(
-        "--min_seg", type=float, default=0.5,
-        help="Filter VTC segments shorter than this (seconds, default: 0.5).",
     )
     parser.add_argument(
         "--audio_fmt", choices=["flac", "wav"], default="flac",
@@ -338,12 +396,10 @@ def main() -> None:
 
     ds = get_dataset_paths(args.dataset)
     print(f"Package pipeline: {args.dataset}")
-    print(f"  output   : {ds.output}")
-    print(f"  audio_fmt: {args.audio_fmt}")
-    print(f"  max_clip : {args.max_clip:.0f}s")
-    print(f"  buffer   : {args.buffer:.0f}s")
-    print(f"  max_gap  : {args.max_gap:.0f}s")
-    print(f"  min_seg  : {args.min_seg:.1f}s")
+    print(f"  output      : {ds.output}")
+    print(f"  audio_fmt   : {args.audio_fmt}")
+    print(f"  max_clip    : {args.max_clip:.0f}s")
+    print(f"  split_search: {args.split_search:.0f}s")
 
     # --- Load manifest ---
     manifest_df = load_manifest(ds.manifest)
@@ -367,9 +423,18 @@ def main() -> None:
     if not has_vad:
         print("  WARN: no VAD segments — clips will lack VAD comparison data")
 
+    # SNR is optional (from Brouhaha pipeline)
+    snr_dir = ds.output / "snr"
+    has_snr = snr_dir.exists() and any(snr_dir.glob("*.npz"))
+    if has_snr:
+        print(f"  SNR data  : {snr_dir}")
+    else:
+        print("  WARN: no SNR data — clips will lack SNR metadata")
+
     # --- Build clips for each file ---
     t0 = time.time()
     all_clips: list[tuple[str, Path, int, Clip]] = []
+    global_tier_counts: dict[str, int] = {t: 0 for t in CUT_TIERS}
     skipped = 0
 
     for row in manifest_df.iter_rows(named=True):
@@ -378,6 +443,7 @@ def main() -> None:
 
         vtc_segs = _load_vtc_segments(ds.output, uid)
         vad_segs = _load_vad_segments(ds.output, uid) if has_vad else []
+        file_snr, snr_step = _load_snr(ds.output, uid) if has_snr else (None, 1.0)
         file_dur = _get_file_duration(ds.metadata, uid)
 
         if file_dur is None:
@@ -385,24 +451,22 @@ def main() -> None:
             skipped += 1
             continue
 
-        if not vtc_segs:
-            print(f"  WARN: no VTC segments for {uid}, skipping")
-            skipped += 1
-            continue
-
-        clips = build_clips(
+        clips, tier_counts = build_clips(
             vtc_segments=vtc_segs,
             vad_segments=vad_segs,
             file_duration=file_dur,
             max_clip_s=args.max_clip,
-            buffer_s=args.buffer,
-            max_gap=args.max_gap,
             split_search_s=args.split_search,
-            min_clip_speech_s=args.min_speech,
-            min_seg_s=args.min_seg,
         )
+        for t, n in tier_counts.items():
+            global_tier_counts[t] += n
 
         for idx, clip in enumerate(clips):
+            if file_snr is not None:
+                clip.snr_array = _slice_snr_for_clip(
+                    file_snr, snr_step, clip.abs_onset, clip.abs_offset,
+                )
+                clip.snr_step_s = snr_step
             all_clips.append((uid, audio_path, idx, clip))
 
     clip_time = time.time() - t0
@@ -415,10 +479,11 @@ def main() -> None:
         print("No clips to write.")
         sys.exit(0)
 
-    # --- Print stats & save figure ---
-    stats = _print_stats(all_clips)
+    # --- Print stats & save figures ---
+    stats = _print_stats(all_clips, global_tier_counts)
     fig_dir = Path("figures") / args.dataset
-    _save_figure(stats, fig_dir / "clip_summary.png")
+    save_figure(stats, fig_dir / "clip_summary.png")
+    save_label_figures(stats, fig_dir / "label_analysis.png")
 
     # --- Write shards ---
     print("Writing shards...", flush=True)
@@ -446,6 +511,15 @@ def main() -> None:
         # Drop segment lists from CSV manifest (too large); keep in JSON
         meta.pop("vad_segments", None)
         meta.pop("vtc_segments", None)
+        meta.pop("snr", None)  # array too large for CSV; kept in JSON
+        # Flatten nested types for CSV compatibility
+        meta["labels_present"] = ";".join(meta.get("labels_present", []))
+        ld = meta.pop("label_durations", {})
+        for lbl in VTC_LABELS:
+            meta[f"dur_{lbl}"] = round(ld.get(lbl, 0.0), 3)
+        vc = meta.pop("vad_coverage_by_label", {})
+        for lbl in VTC_LABELS:
+            meta[f"vad_cov_{lbl}"] = round(vc.get(lbl, 0.0), 3)
         manifest_rows.append(meta)
 
     clip_manifest = pl.DataFrame(manifest_rows)

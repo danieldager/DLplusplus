@@ -140,6 +140,11 @@ def write_shards(
                 f"{audio_fmt}": audio_bytes,
                 "json": json.dumps(meta, ensure_ascii=False).encode("utf-8"),
             }
+            # Add SNR array as binary .npy for efficient downstream loading
+            if clip.snr_array is not None:
+                snr_buf = io.BytesIO()
+                np.save(snr_buf, clip.snr_array)
+                sample["snr.npy"] = snr_buf.getvalue()
             sink.write(sample)  # type: ignore
             count_in_shard += 1
 

@@ -172,6 +172,9 @@ def process_vad_file(args: tuple) -> tuple[dict, list[dict]]:
     save_probs_dir = args[4] if len(args) > 4 else None
     file_id_early = Path(wav_path).stem
 
+    # Seed every spawned worker for reproducibility.
+    set_seeds(42)
+
     try:
         vad = TenVad(hop_size=hop_size, threshold=threshold)
     except Exception as e:

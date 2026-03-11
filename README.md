@@ -29,6 +29,9 @@ cd VTC
 
 # Install Python dependencies:
 uv sync
+
+# Download the Brouhaha SNR model checkpoint (~47 MB, one-time):
+uv run python scripts/download_brouhaha.py
 ```
 
 <details>
@@ -77,19 +80,40 @@ This submits three chained SLURM jobs with automatic dependency handling. See th
 
 ## 3. Pipeline
 
-The pipeline runs three steps, each as a SLURM job:
+The pipeline runs four steps, each as a SLURM job:
 
 | Step | Module | Resource | Description |
 |------|--------|----------|-------------|
 | **1. VAD** | `src.pipeline.vad` | 48 CPUs | TenVAD speech detection (multiprocessed, ~31 MB/worker) |
 | **2. VTC** | `src.pipeline.vtc` | 4× GPU | VTC-2.0 inference with adaptive per-file thresholding |
 | **3. Compare** | `src.pipeline.compare` | 8 CPUs | Per-file IoU / Precision / Recall + diagnostic figures |
+| **4. Package** | `src.pipeline.package` | 4 CPUs | Tile full audio into ≤10-min clips → WebDataset shards |
 
 **Adaptive thresholding:** The VTC model was trained on child-directed speech. For out-of-distribution audio (e.g., audiobook narrators), the default 0.5 sigmoid threshold can miss speech that the model does partially detect. Step 2 uses VAD output to automatically lower the threshold per file until VTC–VAD agreement reaches 90% IoU.
 
 **Activity-region optimization:** For long recordings with sparse speech (< 90% coverage), VTC inference is restricted to speech-active regions only — cutting GPU time by up to 10×.
 
 **Resume support:** Both VAD and VTC save checkpoints. Interrupted jobs can be resubmitted and will skip already-completed files.
+
+### Packaging (Step 4)
+
+The packaging step tiles full audio files into clips of roughly equal length, cutting only at silence gaps (never mid-speech). Cut-point selection uses a **6-tier fallback chain**:
+
+| Tier | Strategy | Severity |
+|------|----------|----------|
+| 1 | Long silence gap (≥10 s) in VAD∪VTC union | Clean |
+| 2 | Any silence gap in VAD∪VTC union | Clean |
+| 3 | Gap in VAD-only mask (VTC still active) | Info |
+| 4 | Gap in VTC-only mask (VAD still active) | Info |
+| 5 | VTC speaker-change boundary (inside active audio) | Warning |
+| 6 | Hard cut — no gaps or boundaries | Warning |
+
+Within each tier, the midpoint closest to the ideal evenly-distributed position is chosen. The pipeline output includes a **tier breakdown** showing how many cuts used each strategy, so you can assess cut quality at a glance.
+
+Output:
+- `output/{dataset}/shards/` — WebDataset `.tar` shards (FLAC audio + JSON metadata)
+- `output/{dataset}/shards/manifest.csv` — per-clip metadata
+- `output/{dataset}/shards/samples/` — random sample clips for manual validation
 
 ---
 
@@ -103,8 +127,14 @@ VTC/
 │   │   ├── vad.py           #   Step 1: Voice activity detection
 │   │   ├── vtc.py           #   Step 2: VTC inference
 │   │   ├── compare.py       #   Step 3: VAD vs VTC comparison
+│   │   ├── package.py       #   Step 4: Audio tiling + WebDataset shards
+│   │   ├── snr.py           #   Brouhaha SNR extraction
 │   │   ├── normalize.py     #   Manifest normalization
 │   │   └── preflight.py     #   Pre-pipeline dataset scan
+│   ├── packaging/           # Clip building, shard writing, listener
+│   │   ├── clips.py         #   Clip tiling algorithm (6-tier fallback)
+│   │   ├── writer.py        #   WebDataset tar shard writer
+│   │   └── listener.py      #   Sample extraction for validation
 │   └── core/                # Reusable, tested modules
 │       ├── intervals.py     #   Interval arithmetic (merge, IoU)
 │       ├── regions.py       #   Activity-region optimization
@@ -118,6 +148,7 @@ VTC/
 │   ├── vad.slurm            # SLURM: VAD (CPU, 48 workers)
 │   ├── vtc.slurm            # SLURM: VTC (GPU array, 4 shards)
 │   ├── compare.slurm        # SLURM: Compare (CPU)
+│   ├── package_test.sh      # SLURM: End-to-end packaging test
 │   └── test.slurm           # SLURM: pytest on compute node
 ├── tests/                   # pytest suite covering all core modules
 │   ├── conftest.py          #   Stitched audio fixtures
@@ -127,8 +158,15 @@ VTC/
 │   ├── test_checkpoint.py
 │   ├── test_metadata.py
 │   ├── test_parallel.py
+│   ├── test_clips.py        #   Clip tiling + tier fallback chain
 │   ├── test_vad_processing.py
+│   ├── test_reproducibility.py
 │   └── test_stitched_audio.py
+├── scripts/
+│   └── download_brouhaha.py # Auto-download Brouhaha checkpoint
+├── models/                  # Brouhaha checkpoint (gitignored, auto-downloaded)
+│   └── best/checkpoints/
+│       └── best.ckpt        #   ~47 MB, from ylacombe/brouhaha-best
 ├── VTC-2.0/                 # Model weights & config
 │   └── model/
 │       ├── best.ckpt        #   Trained checkpoint (~1 GB, git-lfs)

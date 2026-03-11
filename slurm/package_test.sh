@@ -95,13 +95,12 @@ PKG_JOB=$(sbatch --parsable \
         echo \"Job: \$SLURM_JOB_ID  Node: \$(hostname)\"
         echo \"Started: \$(date '+%Y-%m-%d %H:%M:%S')\"
 
+        ## Tiles full audio into clips, cutting only at silence gaps
+        ## All VAD and VTC onsets/offsets should be shifted to relative timestamps
         PYTHONUNBUFFERED=1 \\
         uv run python -m src.pipeline.package $DATASET \\
             --sample $SAMPLE \\
             --audio_fmt flac \\
-            --buffer 5 \\
-            --max_gap 10 \\
-            --min_seg 0.5 \\
             --max_clip 600
 
         echo ''
@@ -109,7 +108,7 @@ PKG_JOB=$(sbatch --parsable \
         PYTHONUNBUFFERED=1 \\
         uv run python -m src.packaging.listener \\
             output/$DATASET/shards \\
-            -n 50 --seed 42 --wav
+            -n 50 --seed 42 --wav --diverse
 
         echo ''
         echo \"Completed: \$(date '+%H:%M:%S')\"

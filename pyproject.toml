@@ -11,6 +11,7 @@ dependencies = [
     "openpyxl>=3.1.5",
     "polars>=1.0",
     "pyarrow>=23.0.1",
+    "brouhaha",
     "segma",
     "soundfile>=0.13",
     "ten-vad>=1.0.6.8",
@@ -24,6 +25,7 @@ python_functions = ["test_*"]
 addopts = ["-v", "--tb=short", "-rA", "--durations=10"]
 
 [tool.uv.sources]
+brouhaha = { git = "https://github.com/marianne-m/brouhaha-vad", rev = "1e175a9dee0f4d7c618653d64796a45405a768e1" }
 segma = { git = "https://github.com/arxaqapi/segma", rev = "ea8a54be363ef3ce15e00a7252eb637dcfaac495" }
 
 [tool.uv]
@@ -31,4 +33,6 @@ override-dependencies = [
     "torch==2.9.0",
     "torchaudio==2.9.0",
     "torchcodec==0.9.*",
+    "numpy>=2.0",
+    "pyannote-audio>=3.4,<4",
 ]

@@ -1,208 +1,384 @@
-"""Tests for the VTC-based clip building algorithm."""
+"""Tests for the full-audio clip tiling algorithm."""
 
 from __future__ import annotations
 
 import pytest
 
-from src.packaging.clips import Clip, Segment, build_clips, _merge_segments, _compute_iou
+from src.packaging.clips import (
+    CUT_TIERS, Clip, Segment,
+    build_clips as _build_clips_raw,
+    _build_activity_union,
+    _find_silence_gaps, _compute_iou,
+)
+
+
+def build_clips(*args, **kwargs) -> list[Clip]:
+    """Wrapper that discards tier_counts for convenience in most tests."""
+    clips, _tier_counts = _build_clips_raw(*args, **kwargs)
+    return clips
 
 
 # ---------------------------------------------------------------------------
-# _merge_segments
+# _build_activity_union
 # ---------------------------------------------------------------------------
 
 
-class TestMergeSegments:
+class TestBuildActivityUnion:
     def test_empty(self):
-        assert _merge_segments([], max_gap=10) == []
+        assert _build_activity_union([], []) == []
 
-    def test_single(self):
-        segs = [Segment(onset=10, offset=20, label="FEM")]
-        regions = _merge_segments(segs, max_gap=5)
-        assert len(regions) == 1
-        assert regions[0][0] == 10
-        assert regions[0][1] == 20
+    def test_single_vtc(self):
+        vtc = [Segment(onset=10, offset=20, label="FEM")]
+        result = _build_activity_union(vtc, [])
+        assert len(result) == 1
+        assert result[0].onset == 10
+        assert result[0].offset == 20
 
-    def test_merge_within_gap(self):
-        segs = [
+    def test_overlapping_vad_vtc(self):
+        vtc = [Segment(onset=10, offset=25, label="FEM")]
+        vad = [Segment(onset=20, offset=35)]
+        result = _build_activity_union(vtc, vad)
+        assert len(result) == 1
+        assert result[0].onset == 10
+        assert result[0].offset == 35
+
+    def test_disjoint(self):
+        vtc = [Segment(onset=10, offset=20, label="FEM")]
+        vad = [Segment(onset=30, offset=40)]
+        result = _build_activity_union(vtc, vad)
+        assert len(result) == 2
+
+    def test_multiple_overlaps_merge(self):
+        vtc = [
             Segment(onset=10, offset=20, label="FEM"),
-            Segment(onset=25, offset=35, label="MAL"),
+            Segment(onset=15, offset=25, label="MAL"),
         ]
-        regions = _merge_segments(segs, max_gap=10)
-        assert len(regions) == 1
-        assert regions[0][0] == 10
-        assert regions[0][1] == 35
-
-    def test_split_beyond_gap(self):
-        segs = [
-            Segment(onset=10, offset=20, label="FEM"),
-            Segment(onset=50, offset=60, label="MAL"),
-        ]
-        regions = _merge_segments(segs, max_gap=10)
-        assert len(regions) == 2
-
-    def test_unsorted_input(self):
-        segs = [
-            Segment(onset=50, offset=60, label="FEM"),
-            Segment(onset=10, offset=20, label="MAL"),
-        ]
-        regions = _merge_segments(segs, max_gap=5)
-        assert len(regions) == 2
-        assert regions[0][0] == 10
+        vad = [Segment(onset=22, offset=30)]
+        result = _build_activity_union(vtc, vad)
+        assert len(result) == 1
+        assert result[0].onset == 10
+        assert result[0].offset == 30
 
 
 # ---------------------------------------------------------------------------
-# build_clips — basic (now VTC-based)
+# _find_silence_gaps
+# ---------------------------------------------------------------------------
+
+
+class TestFindSilenceGaps:
+    def test_no_activity(self):
+        gaps = _find_silence_gaps([], 0, 100)
+        assert gaps == [(0, 100)]
+
+    def test_full_activity(self):
+        active = [Segment(onset=0, offset=100)]
+        gaps = _find_silence_gaps(active, 0, 100)
+        assert gaps == []
+
+    def test_gap_before_and_after(self):
+        active = [Segment(onset=30, offset=60)]
+        gaps = _find_silence_gaps(active, 0, 100)
+        assert len(gaps) == 2
+        # Sorted longest first: (60,100)=40s then (0,30)=30s
+        assert gaps[0] == (60, 100)
+        assert gaps[1] == (0, 30)
+
+    def test_gap_between_segments(self):
+        active = [
+            Segment(onset=10, offset=20),
+            Segment(onset=50, offset=80),
+        ]
+        gaps = _find_silence_gaps(active, 0, 100)
+        # (20,50)=30s, (80,100)=20s, (0,10)=10s
+        assert gaps[0] == (20, 50)
+
+
+# ---------------------------------------------------------------------------
+# build_clips — basic tiling
 # ---------------------------------------------------------------------------
 
 
 class TestBuildClips:
-    def test_empty_segments(self):
-        clips = build_clips([], file_duration=1000)
+    def test_zero_duration(self):
+        clips = build_clips([], file_duration=0)
         assert clips == []
 
-    def test_single_short_segment(self):
-        vtc = [Segment(onset=100, offset=130, label="FEM")]
-        clips = build_clips(vtc, file_duration=3600, buffer_s=5)
+    def test_short_file_single_clip(self):
+        """A file shorter than max_clip_s → exactly one clip."""
+        vtc = [Segment(onset=10, offset=50, label="FEM")]
+        clips = build_clips(vtc, file_duration=300, max_clip_s=600)
         assert len(clips) == 1
-        assert clips[0].abs_onset == 95.0
-        assert clips[0].abs_offset == 135.0
-        assert len(clips[0].vtc_segments) == 1
+        assert clips[0].abs_onset == 0.0
+        assert clips[0].abs_offset == 300.0
+
+    def test_covers_full_duration(self):
+        """Clips must cover [0, file_duration] with no gaps."""
+        vtc = [Segment(onset=100, offset=200, label="FEM")]
+        clips = build_clips(vtc, file_duration=3600, max_clip_s=600)
+        assert clips[0].abs_onset == 0.0
+        assert clips[-1].abs_offset == 3600.0
+        # No gaps between clips
+        for i in range(1, len(clips)):
+            assert abs(clips[i].abs_onset - clips[i - 1].abs_offset) < 0.01
+
+    def test_no_segments_still_produces_clips(self):
+        """Even with no VTC/VAD, the full file is tiled."""
+        clips = build_clips([], vad_segments=[], file_duration=1200, max_clip_s=600)
+        assert len(clips) >= 1
+        assert clips[0].abs_onset == 0.0
+        assert clips[-1].abs_offset == 1200.0
 
     def test_vad_assigned_to_clip(self):
-        """VAD segments overlapping the clip get assigned."""
+        """VAD segments overlapping a clip get assigned."""
         vtc = [Segment(onset=100, offset=130, label="FEM")]
         vad = [
             Segment(onset=95, offset=135),   # overlaps
-            Segment(onset=500, offset=520),   # outside
+            Segment(onset=900, offset=920),  # different clip
         ]
-        clips = build_clips(vtc, vad_segments=vad, file_duration=3600, buffer_s=5)
+        clips = build_clips(vtc, vad_segments=vad, file_duration=300, max_clip_s=600)
         assert len(clips) == 1
-        assert len(clips[0].vad_segments) == 1
+        assert len(clips[0].vad_segments) >= 1
         assert len(clips[0].vtc_segments) == 1
 
-    def test_buffer_clamped_to_zero(self):
-        vtc = [Segment(onset=2, offset=30, label="FEM")]
-        clips = build_clips(vtc, file_duration=3600, buffer_s=5)
-        assert clips[0].abs_onset == 0.0
-
-    def test_buffer_clamped_to_file_end(self):
-        vtc = [Segment(onset=3590, offset=3598, label="MAL")]
-        clips = build_clips(vtc, file_duration=3600, buffer_s=5)
-        assert clips[0].abs_offset == 3600.0
-
-    def test_segments_cluster_within_max_gap(self):
-        """Two VTC segments 5s apart with max_gap=10 → one clip."""
+    def test_vtc_segments_assigned(self):
+        """VTC segments are assigned to the correct clip."""
         vtc = [
             Segment(onset=100, offset=200, label="FEM"),
-            Segment(onset=205, offset=300, label="MAL"),
+            Segment(onset=800, offset=900, label="MAL"),
         ]
-        clips = build_clips(vtc, file_duration=3600, max_gap=10, buffer_s=5)
-        assert len(clips) == 1
+        clips = build_clips(vtc, file_duration=1000, max_clip_s=600)
+        # With 1000s file and 600s max, should produce clips
+        total_vtc = sum(len(c.vtc_segments) for c in clips)
+        assert total_vtc == 2
 
-    def test_segments_split_beyond_max_gap(self):
-        """Two VTC segments far apart → separate clips."""
+    def test_sum_of_durations_equals_file(self):
+        """Total clip duration must equal file duration."""
         vtc = [
-            Segment(onset=100, offset=200, label="FEM"),
-            Segment(onset=900, offset=1000, label="MAL"),
+            Segment(onset=i * 20, offset=i * 20 + 15, label="FEM")
+            for i in range(100)
         ]
-        clips = build_clips(vtc, file_duration=3600, max_gap=10, buffer_s=5)
-        assert len(clips) == 2
-
-    def test_min_seg_filter(self):
-        """Segments shorter than min_seg_s are filtered out."""
-        vtc = [
-            Segment(onset=100, offset=100.3, label="KCHI"),  # 0.3s < 0.5s
-            Segment(onset=200, offset=210, label="FEM"),     # 10s OK
-        ]
-        clips = build_clips(vtc, file_duration=3600, min_seg_s=0.5)
-        assert len(clips) == 1
-        assert len(clips[0].vtc_segments) == 1
-
-    def test_all_short_segments_gives_no_clips(self):
-        """If all VTC segments are filtered, no clips."""
-        vtc = [
-            Segment(onset=100, offset=100.3, label="KCHI"),
-            Segment(onset=200, offset=200.2, label="OCH"),
-        ]
-        clips = build_clips(vtc, file_duration=3600, min_seg_s=0.5)
-        assert clips == []
-
-    def test_min_speech_filter(self):
-        """Clip with < min_clip_speech_s of VTC speech is dropped."""
-        vtc = [Segment(onset=100, offset=102, label="FEM")]  # 2s speech
-        clips = build_clips(vtc, file_duration=3600, min_clip_speech_s=5, min_seg_s=0)
-        assert len(clips) == 0
-
-    def test_greedy_packing(self):
-        """Three close VTC regions that fit into one clip → packed together."""
-        vtc = [
-            Segment(onset=100, offset=200, label="FEM"),
-            Segment(onset=250, offset=300, label="MAL"),
-            Segment(onset=350, offset=400, label="KCHI"),
-        ]
-        clips = build_clips(
-            vtc, file_duration=3600,
-            max_gap=5, buffer_s=5, max_clip_s=600,
-        )
-        # Three regions (gaps 50s > 5s), but total span 300s < 600s → 1 clip
-        assert len(clips) == 1
+        dur = 2500.0
+        clips = build_clips(vtc, file_duration=dur, max_clip_s=600)
+        total = sum(c.duration for c in clips)
+        assert abs(total - dur) < 0.01
 
 
 # ---------------------------------------------------------------------------
-# build_clips — splitting
+# build_clips — splitting behaviour
 # ---------------------------------------------------------------------------
 
 
 class TestBuildClipsSplitting:
-    def test_long_region_gets_split(self):
-        """A 20-minute continuous VTC region → 2+ clips."""
+    def test_long_file_gets_split(self):
+        """A 20-minute file → at least 2 clips."""
         vtc = [Segment(onset=0, offset=1200, label="FEM")]
+        clips = build_clips(vtc, file_duration=1200, max_clip_s=600)
+        assert len(clips) >= 2
+
+    def test_prefers_silence_gap(self):
+        """Insert a silence gap near the ideal boundary; cut should land there."""
+        vtc = [
+            Segment(onset=0, offset=570, label="FEM"),
+            # 30 s silence gap at 570–600
+            Segment(onset=600, offset=1200, label="MAL"),
+        ]
+        clips = build_clips(vtc, file_duration=1200, max_clip_s=600)
+        assert len(clips) >= 2
+        # The cut should be in the silence gap (570–600)
+        cut = clips[0].abs_offset
+        assert 570 <= cut <= 600
+
+    def test_never_cuts_during_activity(self):
+        """With dense activity streaks and clear gaps, cuts land in gaps."""
+        # Activity from 0–580, gap 580–620, activity 620-1200
+        vtc = [
+            Segment(onset=0, offset=580, label="FEM"),
+            Segment(onset=620, offset=1200, label="MAL"),
+        ]
+        clips = build_clips(vtc, file_duration=1200, max_clip_s=600)
+        assert len(clips) >= 2
+        cut = clips[0].abs_offset
+        # Cut should be in the gap 580–620
+        assert 580 <= cut <= 620
+
+    def test_hard_cut_when_no_silence(self):
+        """Continuous activity → forced hard cut (logged)."""
+        vtc = [Segment(onset=0, offset=2000, label="FEM")]
+        vad = [Segment(onset=0, offset=2000)]
         clips = build_clips(
-            vtc, file_duration=1200,
-            max_clip_s=600, buffer_s=0, split_search_s=120, min_seg_s=0,
+            vtc, vad_segments=vad, file_duration=2000,
+            max_clip_s=600, split_search_s=120,
         )
         assert len(clips) >= 2
+        # All audio accounted for
+        assert clips[0].abs_onset == 0.0
+        assert clips[-1].abs_offset == 2000.0
+        # Hard limit respected even with continuous activity
         for c in clips:
-            assert c.duration <= 600 + 120
+            assert c.duration <= 600 + 1
 
-    def test_split_prefers_vtc_silence(self):
-        """Insert a VTC gap at ~580s; the algorithm should split there."""
+    def test_all_clips_within_max_duration(self):
+        """Every clip is ≤ max_clip_s (hard limit)."""
         vtc = [
-            Segment(onset=0, offset=575, label="FEM"),
-            Segment(onset=585, offset=1200, label="MAL"),
+            Segment(onset=start, offset=start + 18, label="FEM")
+            for start in range(0, 5000, 20)
         ]
         clips = build_clips(
-            vtc, file_duration=1200,
-            max_clip_s=600, buffer_s=0, max_gap=5, split_search_s=120,
-            min_seg_s=0,
+            vtc, file_duration=5000,
+            max_clip_s=600, split_search_s=120,
+        )
+        assert len(clips) >= 5
+        for c in clips:
+            assert c.duration <= 600 + 1  # +1 for float tolerance
+
+    def test_slightly_over_max_produces_two_clips(self):
+        """A file slightly longer than max_clip_s must be split, not kept as one."""
+        vtc = [Segment(onset=0, offset=650, label="FEM")]
+        clips = build_clips(vtc, file_duration=650, max_clip_s=600)
+        assert len(clips) == 2
+        for c in clips:
+            assert c.duration <= 600 + 1
+
+    def test_even_distribution(self):
+        """601s should produce ~300s + ~301s, not 600 + 1."""
+        # Pure silence — cuts should land near the ideal midpoint
+        clips = build_clips([], file_duration=601, max_clip_s=600)
+        assert len(clips) == 2
+        # Both clips should be in the 250–400 range, not 600 + 1
+        for c in clips:
+            assert c.duration >= 250
+            assert c.duration <= 400
+
+    def test_even_distribution_three_clips(self):
+        """1500s → 3 clips of ~500s, not 600 + 600 + 300."""
+        clips = build_clips([], file_duration=1500, max_clip_s=600)
+        assert len(clips) == 3
+        for c in clips:
+            assert c.duration >= 400
+            assert c.duration <= 600
+
+    def test_prefers_long_silence_gap(self):
+        """A long gap (>10s) is preferred over a short gap nearer the ideal."""
+        vtc = [
+            Segment(onset=0, offset=280, label="FEM"),
+            # Short 2s gap at 280–282
+            Segment(onset=282, offset=330, label="MAL"),
+            # Long 20s gap at 330–350  (further from ideal=350)
+            Segment(onset=350, offset=700, label="FEM"),
+        ]
+        clips = build_clips(vtc, file_duration=700, max_clip_s=600, min_gap_s=10)
+        assert len(clips) == 2
+        cut = clips[0].abs_offset
+        # Should prefer the long gap 330–350 (midpoint=340)
+        assert 330 <= cut <= 350
+
+    def test_vad_only_gap_fallback(self):
+        """When VAD∪VTC union has no gap but VAD alone does, cut there."""
+        # VTC covers the entire file — no union gap.
+        # VAD has a gap at 580–620 near the ideal cut.
+        vtc = [Segment(onset=0, offset=1200, label="FEM")]
+        vad = [
+            Segment(onset=0, offset=580),
+            Segment(onset=620, offset=1200),
+        ]
+        clips = build_clips(
+            vtc, vad_segments=vad, file_duration=1200,
+            max_clip_s=600, split_search_s=120,
         )
         assert len(clips) >= 2
-        assert clips[0].abs_offset <= 600
+        cut = clips[0].abs_offset
+        # Should land in the VAD gap (580–620)
+        assert 580 <= cut <= 620
 
-    def test_buffer_does_not_remerge_splits(self):
-        """Regression: buffer overlap must not cascade-merge all splits."""
-        vtc = [Segment(onset=0, offset=7200, label="FEM")]
+    def test_vtc_only_gap_fallback(self):
+        """When union and VAD have no gap but VTC alone does, cut there."""
+        # VAD covers the entire file — no union or VAD-only gap.
+        # VTC has a gap at 580–620 near the ideal cut.
+        vtc = [
+            Segment(onset=0, offset=580, label="FEM"),
+            Segment(onset=620, offset=1200, label="MAL"),
+        ]
+        vad = [Segment(onset=0, offset=1200)]
         clips = build_clips(
-            vtc, file_duration=7200,
-            max_clip_s=600, buffer_s=5, split_search_s=120, min_seg_s=0,
+            vtc, vad_segments=vad, file_duration=1200,
+            max_clip_s=600, split_search_s=120,
         )
-        assert len(clips) >= 10
-        for c in clips:
-            assert c.duration <= 750
+        assert len(clips) >= 2
+        cut = clips[0].abs_offset
+        # Should land in the VTC gap (580–620)
+        assert 580 <= cut <= 620
 
-    def test_all_clips_respect_max_duration(self):
-        """Every clip from dense VTC data stays near max_clip_s."""
-        vtc = []
-        for start in range(0, 50000, 20):
-            vtc.append(Segment(onset=start, offset=start + 18, label="FEM"))
+    def test_speaker_boundary_fallback(self):
+        """When no gaps at all, fall back to VTC speaker boundary."""
+        # Both VAD and VTC cover the entire file — no gaps anywhere.
+        # But there's a speaker change at t=580.
+        vtc = [
+            Segment(onset=0, offset=580, label="FEM"),
+            Segment(onset=580, offset=1200, label="MAL"),
+        ]
+        vad = [Segment(onset=0, offset=1200)]
         clips = build_clips(
-            vtc, file_duration=50000,
-            max_clip_s=600, buffer_s=5, max_gap=10, split_search_s=120,
+            vtc, vad_segments=vad, file_duration=1200,
+            max_clip_s=600, split_search_s=120,
         )
-        assert len(clips) >= 50
-        for c in clips:
-            assert c.duration <= 750
+        assert len(clips) >= 2
+        cut = clips[0].abs_offset
+        # Should land at or near the speaker boundary (580)
+        assert 575 <= cut <= 620
+
+
+# ---------------------------------------------------------------------------
+# build_clips — tier counts
+# ---------------------------------------------------------------------------
+
+
+class TestTierCounts:
+    def test_single_clip_no_cuts(self):
+        """A short file produces no cuts → all tier counts zero."""
+        _clips, tier_counts = _build_clips_raw([], file_duration=300, max_clip_s=600)
+        assert sum(tier_counts.values()) == 0
+
+    def test_silence_gap_tier(self):
+        """Cuts in silence → long_union_gap or short_union_gap."""
+        vtc = [
+            Segment(onset=0, offset=280, label="FEM"),
+            Segment(onset=320, offset=600, label="MAL"),
+        ]
+        _clips, tier_counts = _build_clips_raw(
+            vtc, file_duration=600, max_clip_s=400,
+        )
+        # At least one cut should have landed in the 280–320 gap
+        assert tier_counts["long_union_gap"] + tier_counts["short_union_gap"] >= 1
+        assert tier_counts["hard_cut"] == 0
+
+    def test_hard_cut_tier(self):
+        """Continuous activity with a single speaker → hard_cut tier."""
+        vtc = [Segment(onset=0, offset=2000, label="FEM")]
+        vad = [Segment(onset=0, offset=2000)]
+        _clips, tier_counts = _build_clips_raw(
+            vtc, vad_segments=vad, file_duration=2000,
+            max_clip_s=600, split_search_s=120,
+        )
+        assert tier_counts["hard_cut"] >= 1
+
+    def test_vad_only_gap_counted(self):
+        """VAD-only gap fallback is counted correctly."""
+        vtc = [Segment(onset=0, offset=1200, label="FEM")]
+        vad = [
+            Segment(onset=0, offset=580),
+            Segment(onset=620, offset=1200),
+        ]
+        _clips, tier_counts = _build_clips_raw(
+            vtc, vad_segments=vad, file_duration=1200,
+            max_clip_s=600, split_search_s=120,
+        )
+        assert tier_counts["vad_only_gap"] >= 1
+
+    def test_tier_counts_keys(self):
+        """Tier counts dict always has all expected keys."""
+        _clips, tier_counts = _build_clips_raw([], file_duration=0)
+        for tier in CUT_TIERS:
+            assert tier in tier_counts
 
 
 # ---------------------------------------------------------------------------
@@ -280,7 +456,6 @@ class TestClipMetadata:
         ]
         clip.vad_segments = [Segment(onset=5, offset=45)]
         meta = clip.to_metadata("uid", 0)
-        # Check all new fields exist
         assert "vtc_speech_duration" in meta
         assert "vtc_speech_density" in meta
         assert "vad_speech_duration" in meta
@@ -316,9 +491,73 @@ class TestIoU:
         vad = [Segment(onset=10, offset=30)]
         vtc = [Segment(onset=20, offset=40, label="FEM")]
         iou = _compute_iou(vad, vtc, 0, 100)
-        # intersection=10, union=30 → IoU ≈ 0.33
         assert 0.25 < iou < 0.40
 
     def test_empty_segments(self):
         iou = _compute_iou([], [], 0, 100)
         assert iou == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Per-label properties
+# ---------------------------------------------------------------------------
+
+
+class TestPerLabelProperties:
+    def test_label_durations(self):
+        clip = Clip(abs_onset=0, abs_offset=100)
+        clip.vtc_segments = [
+            Segment(onset=10, offset=20, label="FEM"),   # 10s
+            Segment(onset=30, offset=40, label="KCHI"),   # 10s
+            Segment(onset=50, offset=55, label="FEM"),    # 5s
+        ]
+        ld = clip.label_durations
+        assert abs(ld["FEM"] - 15.0) < 0.01
+        assert abs(ld["KCHI"] - 10.0) < 0.01
+        assert "MAL" not in ld
+
+    def test_child_adult_durations(self):
+        clip = Clip(abs_onset=0, abs_offset=100)
+        clip.vtc_segments = [
+            Segment(onset=10, offset=20, label="FEM"),    # adult 10s
+            Segment(onset=30, offset=50, label="KCHI"),   # child 20s
+            Segment(onset=60, offset=65, label="OCH"),    # child 5s
+        ]
+        assert abs(clip.adult_speech_duration - 10.0) < 0.01
+        assert abs(clip.child_speech_duration - 25.0) < 0.01
+        assert abs(clip.child_fraction - 25.0 / 35.0) < 0.01
+
+    def test_dominant_label(self):
+        clip = Clip(abs_onset=0, abs_offset=100)
+        clip.vtc_segments = [
+            Segment(onset=10, offset=20, label="FEM"),
+            Segment(onset=30, offset=60, label="KCHI"),  # longest
+        ]
+        assert clip.dominant_label == "KCHI"
+
+    def test_vad_coverage_by_label(self):
+        clip = Clip(abs_onset=0, abs_offset=100)
+        clip.vtc_segments = [
+            Segment(onset=10, offset=20, label="FEM"),    # 10s, fully covered
+            Segment(onset=30, offset=50, label="KCHI"),   # 20s, not covered
+        ]
+        clip.vad_segments = [
+            Segment(onset=8, offset=22),   # covers FEM fully
+        ]
+        cov = clip.vad_coverage_by_label()
+        assert cov["FEM"] >= 0.95
+        assert cov["KCHI"] == 0.0
+
+    def test_metadata_has_label_fields(self):
+        clip = Clip(abs_onset=0, abs_offset=100)
+        clip.vtc_segments = [
+            Segment(onset=10, offset=20, label="FEM"),
+            Segment(onset=30, offset=40, label="KCHI"),
+        ]
+        meta = clip.to_metadata("uid", 0)
+        assert "child_speech_duration" in meta
+        assert "adult_speech_duration" in meta
+        assert "child_fraction" in meta
+        assert "dominant_label" in meta
+        assert "label_durations" in meta
+        assert "vad_coverage_by_label" in meta
