@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=16G
 #SBATCH --time=00:30:00
-#SBATCH --partition=erc-dupoux,gpu-p1,gpu-p2
+#SBATCH --partition=erc-dupoux,gpu-p1
 
 echo "Node: $(hostname)"
 echo "Started: $(date)"

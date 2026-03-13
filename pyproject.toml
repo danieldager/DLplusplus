@@ -15,6 +15,7 @@ dependencies = [
     "segma",
     "soundfile>=0.13",
     "ten-vad>=1.0.6.8",
+    "panns-inference>=0.1.1",
 ]
 
 [tool.pytest.ini_options]

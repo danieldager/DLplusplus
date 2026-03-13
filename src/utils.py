@@ -12,6 +12,18 @@ import polars as pl
 
 
 # ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
+
+
+def hhmmss(seconds: float) -> str:
+    """Format seconds as HH:MM:SS."""
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
+# ---------------------------------------------------------------------------
 # Supported manifest extensions (in priority order for auto-detection)
 # ---------------------------------------------------------------------------
 
@@ -38,14 +50,12 @@ class DatasetPaths:
     Convention:
         manifests/{dataset}.<ext>
         output/{dataset}/
-        metadata/{dataset}/
         figures/{dataset}/
     """
 
     dataset: str
     manifest: Path
     output: Path
-    metadata: Path
     figures: Path
 
 
@@ -135,7 +145,6 @@ def get_dataset_paths(dataset: str) -> DatasetPaths:
         dataset=dataset,
         manifest=resolve_manifest(dataset),
         output=Path("output") / dataset,
-        metadata=Path("metadata") / dataset,
         figures=Path("figures") / dataset,
     )
 

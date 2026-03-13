@@ -25,8 +25,8 @@ cd "$(dirname "$0")/.." || exit 1
 
 if $FORCE; then
     echo ""
-    echo "Deleting output/${DATASET} and metadata/${DATASET} ..."
-    rm -rf "output/${DATASET}" "metadata/${DATASET}"
+    echo "Deleting output/${DATASET} ..."
+    rm -rf "output/${DATASET}"
 fi
 echo ""
 echo "╔══════════════════════════════════════════╗"

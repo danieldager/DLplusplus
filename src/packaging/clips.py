@@ -119,6 +119,12 @@ class Clip:
     # SNR (set after clip building, from file-level pooled Brouhaha SNR)
     snr_array: np.ndarray | None = field(default=None, repr=False)
     snr_step_s: float = 1.0
+    # C50 clarity (set after clip building, from file-level pooled Brouhaha C50)
+    c50_array: np.ndarray | None = field(default=None, repr=False)
+    # Noise classification (set after clip building, from PANNs pipeline)
+    noise_array: np.ndarray | None = field(default=None, repr=False)  # (n_bins, n_cats)
+    noise_categories: list[str] = field(default_factory=list)  # category names
+    noise_step_s: float = 1.0
 
     @property
     def duration(self) -> float:
@@ -224,6 +230,52 @@ class Clip:
             return None
         return float(np.max(self.snr_array))
 
+    # --- C50 properties ---
+
+    @property
+    def c50_mean(self) -> float | None:
+        """Mean C50 clarity across the clip (dB), or None if not available."""
+        if self.c50_array is None or len(self.c50_array) == 0:
+            return None
+        return float(np.mean(self.c50_array, dtype=np.float32))
+
+    @property
+    def c50_std(self) -> float | None:
+        """Standard deviation of C50 across the clip (dB)."""
+        if self.c50_array is None or len(self.c50_array) == 0:
+            return None
+        return float(np.std(self.c50_array, dtype=np.float32))
+
+    @property
+    def c50_min(self) -> float | None:
+        if self.c50_array is None or len(self.c50_array) == 0:
+            return None
+        return float(np.min(self.c50_array))
+
+    @property
+    def c50_max(self) -> float | None:
+        if self.c50_array is None or len(self.c50_array) == 0:
+            return None
+        return float(np.max(self.c50_array))
+
+    # --- Noise properties ---
+
+    @property
+    def noise_profile(self) -> dict[str, float] | None:
+        """Mean probability per noise category across the clip."""
+        if self.noise_array is None or len(self.noise_array) == 0:
+            return None
+        means = self.noise_array.mean(axis=0).astype(np.float32)
+        return {cat: float(means[i]) for i, cat in enumerate(self.noise_categories)}
+
+    @property
+    def dominant_noise(self) -> str | None:
+        """Noise category with highest mean probability in this clip."""
+        profile = self.noise_profile
+        if not profile:
+            return None
+        return max(profile, key=lambda k: profile[k])
+
     # --- Per-label properties ---
 
     @property
@@ -318,6 +370,21 @@ class Clip:
             "snr": (
                 [round(float(v), 1) for v in self.snr_array]
                 if self.snr_array is not None else None
+            ),
+            # C50 clarity (from Brouhaha)
+            "c50_mean": round(self.c50_mean, 1) if self.c50_mean is not None else None,
+            "c50_std": round(self.c50_std, 1) if self.c50_std is not None else None,
+            "c50_min": round(self.c50_min, 1) if self.c50_min is not None else None,
+            "c50_max": round(self.c50_max, 1) if self.c50_max is not None else None,
+            "c50": (
+                [round(float(v), 1) for v in self.c50_array]
+                if self.c50_array is not None else None
+            ),
+            # Noise classification (from PANNs)
+            "dominant_noise": self.dominant_noise,
+            "noise_profile": (
+                {k: round(v, 4) for k, v in self.noise_profile.items()}
+                if self.noise_profile is not None else None
             ),
             # Segment details (relative timestamps)
             "vad_segments": [

@@ -4,7 +4,7 @@ TenVAD pipeline: voice activity detection with multiprocessing.
 
 All paths derived from the dataset name:
     manifests/{dataset}.parquet          input manifest
-    metadata/{dataset}/metadata.parquet  per-file metadata
+    output/{dataset}/vad_meta/           per-file metadata + checkpoints
     output/{dataset}/vad_raw/            raw VAD segments
     output/{dataset}/vad_merged/         merged VAD segments
 
@@ -51,7 +51,7 @@ def main() -> None:
     )
     parser.add_argument(
         "dataset",
-        help="Dataset name — used to derive output/, metadata/, and figures/ directories.",
+        help="Dataset name — used to derive output/ and figures/ directories.",
     )
     parser.add_argument("--hop-size", type=int, default=256)
     parser.add_argument("--threshold", type=float, default=0.5)
@@ -113,7 +113,7 @@ def main() -> None:
         print("Nothing to process.")
         sys.exit(0)
 
-    out_dir = ds.metadata
+    out_dir = ds.output / "vad_meta"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------

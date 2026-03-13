@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=48
 #SBATCH --mem=128G
 #SBATCH --time=24:00:00
-#SBATCH --partition=cpu,erc-dupoux,gpu-p1,gpu-p2
+#SBATCH --partition=erc-dupoux,gpu-p1
 
 DATASET="$1"
 shift 1  # remaining args (--manifest, --path-col, --audio-root) passed to vad.py
@@ -37,5 +37,8 @@ uv run src/pipeline/vad.py "$DATASET" \
     --workers "$SLURM_CPUS_PER_TASK" \
     "$@"
 
+EXIT_CODE=$?
+
 echo ""
-echo "VAD completed: $(date '+%H:%M:%S')"
+echo "VAD completed: $(date '+%H:%M:%S')  exit=$EXIT_CODE"
+exit $EXIT_CODE

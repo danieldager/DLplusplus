@@ -5,9 +5,9 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
-#SBATCH --partition=erc-dupoux,gpu-p1,gpu-p2
+#SBATCH --partition=erc-dupoux,gpu-p1
 #SBATCH --gres=gpu:1
-#SBATCH --array=0-3
+#SBATCH --array=0-2
 
 DATASET="$1"
 shift 1  # remaining args passed through to vtc.py

@@ -1,193 +1,130 @@
 #!/bin/bash
 # ==========================================================================
-#  Full pipeline: Normalize → Preflight → VAD → VTC → Compare
+#  Full pipeline: VAD + VTC + SNR + Noise (parallel) → Package
 #
-#  All paths are derived from DATASET.  Each step submits a SLURM job with
-#  appropriate dependencies so the chain runs end-to-end.
+#  VAD, VTC, SNR, and Noise are independent and launch simultaneously.
+#  Package depends on all four and also runs VAD–VTC comparison internally.
 #
-#  On the first run with a non-standard manifest (--manifest, --path-col,
-#  --audio-root), the pipeline normalizes it into manifests/{DATASET}.csv
-#  with absolute paths in a 'path' column.  Subsequent runs need only the
-#  dataset name.
+#  GPU budget: VTC(3) + SNR(1) + Noise(1) = 5 GPUs max.
+#
+#  Both VAD and VTC use a fixed 0.5 sigmoid threshold.
+#
+#  For threshold-sensitivity analysis, see:
+#    bash slurm/threshold_analysis.sh seedlings_1 --sample 0.05
 #
 #  Usage:
-#    bash slurm/pipeline.sh [DATASET] [OPTIONS]
-#
-#  First run (non-standard manifest):
-#    bash slurm/pipeline.sh my_data --manifest /data/meta.xlsx \
-#        --path-col recording_id --audio-root /store/audio/
-#
-#  Subsequent runs:
-#    bash slurm/pipeline.sh my_data
-#
-#  Positional:
-#    DATASET          Dataset name (default: "chunks30").  Used to derive
-#                     output / metadata / figures directories and to locate
-#                     the manifest in the manifests/ folder.
-#
-#  Options:
-#    --manifest PATH  Path to a source manifest to normalize.
-#    --path-col COL   Column containing audio paths (default: "path").
-#    --audio-root DIR Root directory for relative audio paths.
-#    --sample N       Process only a random subset of files (for testing).
-#                     Pass an integer ≥ 1 for an exact count, or a float
-#                     in (0,1) for a fraction.  E.g. --sample 500 or 0.1.
-#    --overwrite      Remove all previous outputs for the dataset.
+#    bash slurm/full_pipeline.sh seedlings_1
+#    bash slurm/full_pipeline.sh seedlings_10 --sample 0.5
 # ==========================================================================
 
 set -euo pipefail
+cd "$(dirname "$0")/.." || exit 1
 
-# ---------- Configuration -------------------------------------------------
-DATASET="chunks30"
-OVERWRITE=false
-MANIFEST=""
-PATH_COL="path"
-AUDIO_ROOT=""
+DATASET="${1:?Usage: bash slurm/full_pipeline.sh DATASET [--sample N]}"
+shift
+
 SAMPLE=""
-
-# Parse arguments
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --overwrite)
-            OVERWRITE=true
-            shift
-            ;;
-        --manifest)
-            MANIFEST="$2"
-            shift 2
-            ;;
-        --path_col)
-            PATH_COL="$2"
-            shift 2
-            ;;
-        --audio_root)
-            AUDIO_ROOT="$2"
-            shift 2
-            ;;
-        --sample)
-            SAMPLE="$2"
-            shift 2
-            ;;
-        --help|-h)
-            head -n 38 "$0" | grep '^#' | sed 's/^# \?//'
-            exit 0
-            ;;
-        -*)
-            echo "ERROR: Unknown option: $1"
-            echo "Run with --help for usage information."
-            exit 1
-            ;;
-        *)
-            DATASET="$1"
-            shift
-            ;;
+        --sample) SAMPLE="$2"; shift 2 ;;
+        *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
 
-# VTC array: how many GPU tasks to split inference across
-VTC_ARRAY_COUNT=4
-
-# Adaptive thresholding parameters (passed to VTC step)
-TARGET_IOU=0.9
-THRESHOLD_MIN=0.1
-THRESHOLD_STEP=0.1
-
-# Downstream scripts only need --sample (manifest args handled by normalize)
 EXTRA_ARGS=""
-if [ -n "$SAMPLE" ]; then
-    EXTRA_ARGS="--sample $SAMPLE"
-fi
+[[ -n "$SAMPLE" ]] && EXTRA_ARGS="--sample $SAMPLE"
 
-# ---------- Overwrite: clear previous run data ----------------------------
-if [ "$OVERWRITE" = true ]; then
-    echo ""
-    echo "Clearing previous data for '$DATASET'"
-    rm -rf "output/${DATASET}"
-    rm -rf "metadata/${DATASET}"
-    rm -rf "figures/${DATASET}"
-fi
+VTC_ARRAY_COUNT=2
+SNR_ARRAY_COUNT=2
+NOISE_ARRAY_COUNT=2
+VTC_THRESHOLD=0.5          # fixed sigmoid threshold — no adaptive sweep
 
-mkdir -p logs/vad logs/vtc logs/compare
+mkdir -p logs/{vad,vtc,snr,noise,package}
 
-# ==========================================================================
-# STEP 0a — Normalize manifest (only when non-standard args are given)
-# ==========================================================================
-NEEDS_NORMALIZE=false
-if [ -n "$MANIFEST" ] || [ "$PATH_COL" != "path" ] || [ -n "$AUDIO_ROOT" ]; then
-    NEEDS_NORMALIZE=true
-fi
-
-if [ "$NEEDS_NORMALIZE" = true ]; then
-    echo ""
-    echo "Normalizing manifest..."
-    NORM_ARGS="$DATASET"
-    [ -n "$MANIFEST" ]       && NORM_ARGS="$NORM_ARGS --manifest $MANIFEST"
-    [ "$PATH_COL" != "path" ] && NORM_ARGS="$NORM_ARGS --path-col $PATH_COL"
-    [ -n "$AUDIO_ROOT" ]     && NORM_ARGS="$NORM_ARGS --audio-root $AUDIO_ROOT"
-
-    PYTHONPATH="${PYTHONPATH:-}:$(pwd)" uv run python3 src/pipeline/normalize.py $NORM_ARGS
-    if [ $? -ne 0 ]; then
-        echo "ERROR: Manifest normalization failed." >&2
-        exit 1
-    fi
-else
-    # Validate that the manifest exists for this dataset
-    PYTHONPATH="${PYTHONPATH:-}:$(pwd)" uv run python3 -c "
-from src.utils import resolve_manifest
-import sys
-try:
-    p = resolve_manifest('${DATASET}')
-    print(f'  Manifest: {p}')
-except (FileNotFoundError, ValueError) as e:
-    print(f'ERROR: {e}', file=sys.stderr)
-    sys.exit(1)
-"
-    if [ $? -ne 0 ]; then
-        exit 1
-    fi
-fi
-
-# ==========================================================================
-# STEP 0b — Preflight: dataset summary & ETA estimate
-# ==========================================================================
 echo ""
-PYTHONPATH="${PYTHONPATH:-}:$(pwd)" uv run python3 src/pipeline/preflight.py "$DATASET" \
-    --vtc-tasks "$VTC_ARRAY_COUNT" \
-    --vad-workers 48 \
-    $EXTRA_ARGS
-
-echo "Pipeline: $DATASET  sample=${SAMPLE:-all}  GPUs=$VTC_ARRAY_COUNT"
+echo "╔══════════════════════════════════════════════════════════╗"
+echo "║  Full pipeline: $DATASET"
+echo "║  sample=${SAMPLE:-all}"
+echo "║  GPUs: VTC=$VTC_ARRAY_COUNT  SNR=$SNR_ARRAY_COUNT  Noise=$NOISE_ARRAY_COUNT"
+echo "║  VTC threshold=${VTC_THRESHOLD}  (fixed, no sweep)"
+echo "║  VAD + VTC + SNR + Noise run in parallel"
+echo "╚══════════════════════════════════════════════════════════╝"
 echo ""
 
-# ---------- Step 1: VAD ---------------------------------------------------
+# ---------- Steps 1-4: VAD + VTC + SNR + Noise (all parallel) ------------
 
 VAD_JOB=$(sbatch --parsable \
     slurm/vad.slurm "$DATASET" $EXTRA_ARGS)
 
-echo "  VAD     : $VAD_JOB"
+echo "  1. VAD            : $VAD_JOB"
 
-# ---------- Step 2: VTC ---------------------------------------------------
-
-ARRAY_SPEC="0-$((VTC_ARRAY_COUNT - 1))"
+VTC_ARRAY="0-$((VTC_ARRAY_COUNT - 1))"
 
 VTC_JOB=$(sbatch --parsable \
-    --dependency=afterok:${VAD_JOB} \
-    --array="${ARRAY_SPEC}" \
+    --array="${VTC_ARRAY}" \
     slurm/vtc.slurm "$DATASET" \
-        --target_iou "$TARGET_IOU" \
-        --threshold_min "$THRESHOLD_MIN" \
-        --threshold_step "$THRESHOLD_STEP" \
+        --threshold "$VTC_THRESHOLD" \
         $EXTRA_ARGS)
 
-echo "  VTC     : $VTC_JOB  (array ${ARRAY_SPEC})"
+echo "  2. VTC            : $VTC_JOB  (array ${VTC_ARRAY})"
 
-# ---------- Step 3: Compare -----------------------------------------------
+SNR_ARRAY="0-$((SNR_ARRAY_COUNT - 1))"
 
-CMP_JOB=$(sbatch --parsable \
-    --dependency=afterok:${VTC_JOB} \
-    slurm/compare.slurm "$DATASET")
+SNR_JOB=$(sbatch --parsable \
+    --array="${SNR_ARRAY}" \
+    slurm/snr.slurm "$DATASET" $EXTRA_ARGS)
 
-echo "  Compare : $CMP_JOB"
+echo "  3. SNR (Brouhaha) : $SNR_JOB  (array ${SNR_ARRAY})"
+
+NOISE_ARRAY="0-$((NOISE_ARRAY_COUNT - 1))"
+
+NOISE_JOB=$(sbatch --parsable \
+    --array="${NOISE_ARRAY}" \
+    slurm/noise.slurm "$DATASET" $EXTRA_ARGS)
+
+echo "  4. Noise (PANNs)  : $NOISE_JOB  (array ${NOISE_ARRAY})"
+
+# ---------- Step 5: Package + Compare + Dashboard (after all) -------------
+
+PKG_JOB=$(sbatch --parsable \
+    --dependency=afterok:${VAD_JOB}:${VTC_JOB}:${SNR_JOB}:${NOISE_JOB} \
+    --job-name=pkg_dash \
+    --output=logs/package/pkg_%j.out \
+    --error=logs/package/pkg_%j.err \
+    --cpus-per-task=8 \
+    --mem=64G \
+    --time=04:00:00 \
+    --partition=erc-dupoux,gpu-p1 \
+    --wrap="
+        set -euo pipefail
+        module purge && module load ffmpeg
+        export LD_LIBRARY_PATH=/shared/opt/linux-rocky9-x86_64/gcc-11.4.1/ffmpeg-6.1.1-gynsavpssxgp4ewikkmsa6jswfgi3ycg/lib:\${LD_LIBRARY_PATH:-}
+        export PYTHONPATH=\${PYTHONPATH:-}:\$(pwd)
+        export POLARS_SKIP_CPU_CHECK=1
+
+        echo ''
+        echo 'Step 5/5  Package + Compare + Dashboard'
+        echo '━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+        echo \"Job: \$SLURM_JOB_ID  Node: \$(hostname)\"
+        echo \"Started: \$(date '+%Y-%m-%d %H:%M:%S')\"
+        echo ''
+
+        PYTHONUNBUFFERED=1 \\
+        uv run python -m src.pipeline.package $DATASET \\
+            $EXTRA_ARGS \\
+            --audio_fmt flac \\
+            --max_clip 600
+
+        echo ''
+        echo \"Completed: \$(date '+%H:%M:%S')\"
+    ")
+
+echo "  5. Package+Dash   : $PKG_JOB"
+
 echo ""
-echo "Monitor: squeue -u \$USER"
-echo "Cancel:  scancel $VAD_JOB $VTC_JOB $CMP_JOB"
+echo "Chain: [VAD($VAD_JOB) | VTC($VTC_JOB) | SNR($SNR_JOB) | Noise($NOISE_JOB)] → Package($PKG_JOB)"
+echo ""
+echo "Monitor : squeue -u \$USER"
+echo "Cancel  : scancel $VAD_JOB $VTC_JOB $SNR_JOB $NOISE_JOB $PKG_JOB"
+echo "Pkg log : logs/package/pkg_\${PKG_JOB}.out"
+echo ""

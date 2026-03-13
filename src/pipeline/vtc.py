@@ -1,17 +1,11 @@
 #!/usr/bin/env python3
 """
-VTC inference with adaptive per-file thresholding.
+VTC inference with fixed per-file thresholding.
 
 For each audio file in the manifest shard:
   1. Forward pass through segma model → raw logits
-  2. If VAD segments are available: sweep sigmoid thresholds (high → low)
-     and pick the highest threshold where VTC–VAD IoU ≥ ``--target_iou``
-  3. Otherwise: apply default threshold (0.5)
-  4. Convert thresholded logits to labelled speech segments
-
-When VAD activity regions cover < 90 % of the file the forward pass is
-restricted to those regions only — cutting GPU time on long recordings
-with low speech ratios by up to 10×.
+  2. Apply fixed sigmoid threshold (default 0.5)
+  3. Convert thresholded logits to labelled speech segments
 
 Paths are derived from the dataset name:
     manifests/{dataset}.parquet        input manifest
@@ -19,11 +13,10 @@ Paths are derived from the dataset name:
     output/{dataset}/vtc_merged/       merged VTC segments (parquet shards)
     output/{dataset}/vtc_meta/         per-file metadata   (parquet shards)
     output/{dataset}/logits/           [optional] saved logits
-    output/{dataset}/vad_merged/       VAD reference (read-only)
 
 Usage:
     python -m src.pipeline.vtc chunks30
-    python -m src.pipeline.vtc chunks30 --target_iou 0.85
+    python -m src.pipeline.vtc chunks30 --threshold 0.5
 
 SLURM array:
     python -m src.pipeline.vtc chunks30 \\
@@ -47,31 +40,23 @@ patch_torchaudio()
 
 from segma.config import load_config
 from segma.config.base import Config
+from segma.inference import apply_model_on_audio
 from segma.models import Models
 from segma.utils.encoders import MultiLabelEncoder
-from segma.utils.io import get_audio_info
+
+from segma.inference import apply_thresholds, create_intervals
 
 from src.core.intervals import intervals_to_segments
 from src.core.metadata import (
-    load_vad_merged,
     vtc_error_row,
     vtc_meta_row,
-)
-from src.core.regions import (
-    activity_region_coverage,
-    forward_pass_full_file,
-    forward_pass_regions,
-    merge_into_activity_regions,
-)
-from src.core.thresholds import (
-    apply_default_threshold_regions,
-    find_best_threshold_regions,
 )
 from src.core.vad_processing import set_seeds
 from src.utils import (
     add_sample_argument,
     atomic_write_parquet,
     get_dataset_paths,
+    hhmmss,
     load_manifest,
     log_benchmark,
     merge_segments_df,
@@ -88,11 +73,26 @@ logging.basicConfig(
 logger = logging.getLogger("vtc")
 
 
-def _hhmmss(seconds: float) -> str:
-    """Format seconds as HH:MM:SS."""
-    h, rem = divmod(int(seconds), 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+def _apply_threshold(
+    region_data: list[tuple[int, torch.Tensor]],
+    threshold: float,
+    conv_settings,
+    l_encoder,
+) -> list[tuple[int, int, str]]:
+    """Apply a fixed sigmoid threshold and return file-absolute intervals."""
+    thresh_dict = {
+        label: {"lower_bound": threshold, "upper_bound": 1.0}
+        for label in l_encoder.labels
+    }
+    all_intervals: list[tuple[int, int, str]] = []
+    for region_start_f, logits_t in region_data:
+        thresholded = apply_thresholds(logits_t, thresh_dict, "cpu").detach()
+        intervals = create_intervals(thresholded, conv_settings, l_encoder)
+        for start_f, end_f, label in intervals:
+            all_intervals.append(
+                (start_f + region_start_f, end_f + region_start_f, label)
+            )
+    return all_intervals
 
 
 # ------------------------------------------------------------------
@@ -104,17 +104,11 @@ def main(
     dataset: str,
     config: str = "VTC-2.0/model/config.yml",
     checkpoint: str = "VTC-2.0/model/best.ckpt",
-    target_iou: float = 0.9,
-    threshold: float | None = None,
-    threshold_max: float = 0.5,
-    threshold_min: float = 0.1,
-    threshold_high: float = 0.9,
-    threshold_step: float = 0.1,
+    threshold: float = 0.5,
     min_duration_on_s: float = 0.1,
     min_duration_off_s: float = 0.3,
     batch_size: int = 128,
     save_logits: bool = False,
-    no_regions: bool = False,
     device: Literal["cuda", "cpu", "mps"] = "cuda",
     array_id: int | None = None,
     array_count: int | None = None,
@@ -122,15 +116,11 @@ def main(
 ):
     set_seeds(42)
 
-    # use fixed threshold, disable sweep & logits
-    fixed_threshold = threshold is not None
-    if fixed_threshold:
-        threshold_max = threshold
-        save_logits = False
     paths = get_dataset_paths(dataset)
     logger.info(f"Dataset: {dataset}")
     logger.info(f"  manifest  : {paths.manifest}")
     logger.info(f"  output    : {paths.output}")
+    logger.info(f"  threshold : {threshold}")
 
     # --------------------------------------------------------------
     # Load manifest and shard
@@ -195,36 +185,6 @@ def main(
     chunk_duration_s = model_config.audio.chunk_duration_s
 
     # --------------------------------------------------------------
-    # Load VAD reference for adaptive thresholding
-    # --------------------------------------------------------------
-    vad_by_uid = load_vad_merged(paths.output)
-    adaptive = bool(vad_by_uid)
-    if adaptive:
-        logger.info(
-            f"Adaptive: {len(vad_by_uid)} VAD refs, " f"target IoU={target_iou}"
-        )
-    else:
-        logger.info("No VAD reference — default threshold")
-
-    # Threshold sweep list (bidirectional from threshold_max)
-    # Upward first (reduces over-detection), then downward.
-    if fixed_threshold:
-        thresholds = [threshold_max]
-        logger.info(f"Fixed threshold: {threshold_max} (no sweep)")
-    else:
-        thresholds = []
-        t = threshold_max
-        while t <= threshold_high + 1e-9:
-            thresholds.append(round(t, 4))
-            t += threshold_step
-        t = threshold_max - threshold_step
-        while t >= threshold_min - 1e-9:
-            thresholds.append(round(t, 4))
-            t -= threshold_step
-        th_str = ", ".join(f"{t:.2f}" for t in thresholds)
-        logger.info(f"Thresholds: [{th_str}]")
-
-    # --------------------------------------------------------------
     # Logit saving (optional)
     # --------------------------------------------------------------
     logits_dir = paths.output / "logits"
@@ -236,7 +196,6 @@ def main(
     # --------------------------------------------------------------
     meta_rows: list[dict] = []
     seg_rows: list[dict] = []
-    n_met_target = 0
     n_errors = 0
     total = len(file_ids_to_process)
     t0 = time.time()
@@ -260,51 +219,19 @@ def main(
 
     for i, uid in enumerate(file_ids_to_process, 1):
         audio_path = Path(uid_to_path[uid])
-        vad_pairs = vad_by_uid.get(uid)
-
-        # --- Decide forward-pass strategy ---
-        use_regions = False
-        activity_regions: list[tuple[float, float]] = []
-        file_dur_s = 0.0
-
-        if not no_regions and adaptive and vad_pairs:
-            try:
-                file_info = get_audio_info(audio_path)
-                file_dur_s = file_info.n_samples / 16_000
-                activity_regions = merge_into_activity_regions(
-                    vad_pairs,
-                    file_dur_s,
-                )
-                coverage = activity_region_coverage(
-                    activity_regions,
-                    file_dur_s,
-                )
-                if coverage < 0.9 and activity_regions:
-                    use_regions = True
-            except Exception:
-                pass  # fall through to full-file processing
 
         # --- Forward pass ---
         try:
-            if use_regions:
-                region_data = forward_pass_regions(
-                    audio_path,
-                    model,
-                    conv_settings,
-                    device,
-                    batch_size,
-                    chunk_duration_s,
-                    activity_regions,
+            with torch.no_grad():
+                logits_t = apply_model_on_audio(
+                    audio_path=audio_path,
+                    model=model,
+                    conv_settings=conv_settings,
+                    device=device,
+                    batch_size=batch_size,
+                    chunk_duration_s=chunk_duration_s,
                 )
-            else:
-                region_data = forward_pass_full_file(
-                    audio_path,
-                    model,
-                    conv_settings,
-                    device,
-                    batch_size,
-                    chunk_duration_s,
-                )
+            region_data = [(0, logits_t)]
         except Exception as e:
             n_errors += 1
             logger.warning(f"{uid}: {e}")
@@ -335,57 +262,19 @@ def main(
             max_sig = 0.0
             mean_sig = 0.0
 
-        # --- Choose threshold ---
-        if adaptive and vad_pairs:
-            chosen, iou, intervals = find_best_threshold_regions(
-                region_data_cpu,
-                vad_pairs,
-                conv_settings,
-                l_encoder,
-                thresholds,
-                target_iou,
-            )
-            met = iou >= target_iou
-            status = "met_target" if met else "best_effort"
-            if met:
-                n_met_target += 1
-
-        elif adaptive and not vad_pairs:
-            chosen, iou, status = threshold_max, 1.0, "vad_empty"
-            intervals = apply_default_threshold_regions(
-                region_data_cpu,
-                threshold_max,
-                conv_settings,
-                l_encoder,
-            )
-
-        else:
-            chosen, iou, status = threshold_max, float("nan"), "default"
-            intervals = apply_default_threshold_regions(
-                region_data_cpu,
-                threshold_max,
-                conv_settings,
-                l_encoder,
-            )
-
-        # Log activity-region stats for the first few files
-        if use_regions and i <= 5:
-            cov = activity_region_coverage(
-                activity_regions,
-                file_dur_s,
-            )
-            logger.info(f"  {uid}")
-            logger.info(
-                f"    {len(activity_regions)} regions, "
-                f"{cov:.0%} coverage, "
-                f"{_hhmmss(file_dur_s)} duration"
-            )
+        # --- Apply threshold ---
+        intervals = _apply_threshold(
+            region_data_cpu,
+            threshold,
+            conv_settings,
+            l_encoder,
+        )
 
         # --- Convert to segments ---
         file_segs = intervals_to_segments(intervals, uid)
         seg_rows.extend(file_segs)
         meta_rows.append(
-            vtc_meta_row(uid, chosen, iou, status, file_segs, max_sig, mean_sig)
+            vtc_meta_row(uid, threshold, file_segs, max_sig, mean_sig)
         )
 
         bytes_done += file_sizes.get(uid, 0)
@@ -496,25 +385,9 @@ def main(
     logger.info(f"{'─' * 50}")
     logger.info(f"Shard {shard_id} complete")
     logger.info(f"  Files     : {processed}/{total}  ({n_errors} errors)")
-    if adaptive and processed > 0:
-        logger.info(f"  Target IoU: {n_met_target}/{processed} met")
-        valid = meta_df.filter(pl.col("vtc_threshold").is_not_nan())
-        if not valid.is_empty():
-            mean_t = valid["vtc_threshold"].mean()
-            mean_i = valid["vtc_vad_iou"].mean()
-            logger.info(f"  Threshold : {mean_t:.3f} mean  " f"IoU: {mean_i:.3f} mean")
-            # Compact threshold distribution on one line
-            dist_parts = []
-            for row in (
-                valid.group_by("vtc_threshold")
-                .len()
-                .sort("vtc_threshold", descending=True)
-                .iter_rows(named=True)
-            ):
-                dist_parts.append(f"{row['vtc_threshold']:.2f}={row['len']}")
-            logger.info(f"  Dist      : {', '.join(dist_parts)}")
+    logger.info(f"  Threshold : {threshold}")
     logger.info(f"  Segments  : {len(seg_df):,} raw, " f"{len(merged_df):,} merged")
-    logger.info(f"  Wall time : {_hhmmss(wall)}")
+    logger.info(f"  Wall time : {hhmmss(wall)}")
     logger.info(f"{'─' * 50}")
 
     # ---- Benchmark logging ----
@@ -537,18 +410,18 @@ def main(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="VTC inference with adaptive per-file thresholding.",
+        description="VTC inference with fixed per-file thresholding.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
             "  python -m src.pipeline.vtc chunks30\n"
-            "  python -m src.pipeline.vtc chunks30 --target_iou 0.85\n"
+            "  python -m src.pipeline.vtc chunks30 --threshold 0.5\n"
             "  python -m src.pipeline.vtc chunks30 --sample 500\n"
         ),
     )
     parser.add_argument(
         "dataset",
-        help="Dataset name — used to derive output/, metadata/, and figures/ directories.",
+        help="Dataset name — used to derive output/ and figures/ directories.",
     )
     parser.add_argument(
         "--config",
@@ -561,40 +434,10 @@ if __name__ == "__main__":
         help="segma model checkpoint (default: VTC-2.0/model/best.ckpt)",
     )
     parser.add_argument(
-        "--target_iou",
-        type=float,
-        default=0.9,
-        help="Per-file VTC–VAD IoU target for adaptive thresholding (default: 0.9)",
-    )
-    parser.add_argument(
         "--threshold",
         type=float,
-        default=None,
-        help="Fixed threshold — skip sweep, no logits. Overrides sweep params.",
-    )
-    parser.add_argument(
-        "--threshold_max",
-        type=float,
         default=0.5,
-        help="Starting threshold for bidirectional sweep (default: 0.5)",
-    )
-    parser.add_argument(
-        "--threshold_min",
-        type=float,
-        default=0.1,
-        help="Minimum threshold to sweep down to (default: 0.1)",
-    )
-    parser.add_argument(
-        "--threshold_high",
-        type=float,
-        default=0.9,
-        help="Maximum threshold to sweep up to (default: 0.9)",
-    )
-    parser.add_argument(
-        "--threshold_step",
-        type=float,
-        default=0.1,
-        help="Threshold step size (default: 0.1)",
+        help="Sigmoid threshold for VTC classification (default: 0.5)",
     )
     parser.add_argument(
         "--min_duration_on_s",
@@ -618,11 +461,6 @@ if __name__ == "__main__":
         "--save_logits",
         action="store_true",
         help="Save per-file logits to output/{dataset}/logits/",
-    )
-    parser.add_argument(
-        "--no_regions",
-        action="store_true",
-        help="Disable activity-region optimization; always run VTC on full files.",
     )
     parser.add_argument(
         "--device",

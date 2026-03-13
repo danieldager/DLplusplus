@@ -22,13 +22,22 @@ import polars as pl
 
 from src.core import LABEL_COLORS, VTC_LABELS
 from src.packaging.clips import CUT_TIERS, Clip, Segment, build_clips
+from src.packaging.stats import save_all_stats
 from src.packaging.writer import write_shards
+from src.plotting.dashboard import save_all_dashboard_figures
 from src.plotting.packaging import save_figure, save_label_figures
 from src.utils import (
     add_sample_argument,
     get_dataset_paths,
     load_manifest,
     sample_manifest,
+)
+from src.pipeline.compare import (
+    calculate_metrics,
+    diagnose_low_iou,
+    load_parquet_dir,
+    plot_dashboard,
+    print_summary,
 )
 
 
@@ -66,9 +75,9 @@ def _load_vtc_segments(output_dir: Path, uid: str) -> list[Segment]:
     return sorted(segments, key=lambda s: s.onset)
 
 
-def _get_file_duration(metadata_dir: Path, uid: str) -> float | None:
+def _get_file_duration(output_dir: Path, uid: str) -> float | None:
     """Get audio duration from VAD metadata."""
-    meta_path = metadata_dir / "metadata.parquet"
+    meta_path = output_dir / "vad_meta" / "metadata.parquet"
     if not meta_path.exists():
         return None
     df = pl.read_parquet(meta_path).filter(pl.col("file_id") == uid)
@@ -79,19 +88,21 @@ def _get_file_duration(metadata_dir: Path, uid: str) -> float | None:
 
 def _load_snr(
     output_dir: Path, uid: str,
-) -> tuple[np.ndarray | None, float]:
-    """Load pooled SNR array for one file.
+) -> tuple[np.ndarray | None, np.ndarray | None, float]:
+    """Load pooled SNR and C50 arrays for one file.
 
-    Returns ``(pooled_snr_float32, pool_step_s)`` or ``(None, 1.0)``
-    if the SNR file is not found.
+    Returns ``(snr_float32, c50_float32, pool_step_s)`` or
+    ``(None, None, 1.0)`` if the SNR file is not found.
+    C50 may be None for older .npz files that lack it.
     """
     snr_path = output_dir / "snr" / f"{uid}.npz"
     if not snr_path.exists():
-        return None, 1.0
+        return None, None, 1.0
     data = np.load(snr_path)
     snr = data["snr"].astype(np.float32)
     pool_step_s = float(data["pool_step_s"])
-    return snr, pool_step_s
+    c50 = data["c50"].astype(np.float32) if "c50" in data else None
+    return snr, c50, pool_step_s
 
 
 def _slice_snr_for_clip(
@@ -111,6 +122,41 @@ def _slice_snr_for_clip(
     start_idx = max(0, min(start_idx, len(file_snr)))
     end_idx = max(start_idx, min(end_idx, len(file_snr)))
     return file_snr[start_idx:end_idx].astype(np.float16)
+
+
+def _load_noise(
+    output_dir: Path, uid: str,
+) -> tuple[np.ndarray | None, list[str], float]:
+    """Load pooled noise category probabilities for one file.
+
+    Returns ``(categories_array, category_names, pool_step_s)`` or
+    ``(None, [], 1.0)`` if the noise file is not found.
+    """
+    noise_path = output_dir / "noise" / f"{uid}.npz"
+    if not noise_path.exists():
+        return None, [], 1.0
+    data = np.load(noise_path, allow_pickle=True)
+    cats = data["categories"].astype(np.float32)    # (n_bins, n_cats)
+    cat_names = list(data["category_names"])         # list[str]
+    pool_step_s = float(data["pool_step_s"])
+    return cats, cat_names, pool_step_s
+
+
+def _slice_noise_for_clip(
+    file_noise: np.ndarray,
+    pool_step_s: float,
+    abs_onset: float,
+    abs_offset: float,
+) -> np.ndarray:
+    """Slice file-level pooled noise categories for one clip.
+
+    Returns a float16 array of shape (n_bins, n_cats).
+    """
+    start_idx = int(abs_onset / pool_step_s)
+    end_idx = int(np.ceil(abs_offset / pool_step_s))
+    start_idx = max(0, min(start_idx, file_noise.shape[0]))
+    end_idx = max(start_idx, min(end_idx, file_noise.shape[0]))
+    return file_noise[start_idx:end_idx].astype(np.float16)
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +194,13 @@ def _print_stats(
     snr_mins = np.array(snr_mins_list) if snr_mins_list else np.array([])
     snr_maxs = np.array(snr_maxs_list) if snr_maxs_list else np.array([])
     has_snr_data = len(snr_means) > 0
+
+    # C50 per clip (optional — from Brouhaha clarity output)
+    c50_means_list = [c.c50_mean for c in all_clips if c.c50_mean is not None]
+    c50_stds_list = [c.c50_std for c in all_clips if c.c50_std is not None]
+    c50_means = np.array(c50_means_list) if c50_means_list else np.array([])
+    c50_stds = np.array(c50_stds_list) if c50_stds_list else np.array([])
+    has_c50_data = len(c50_means) > 0
 
     # Per-label segment data
     label_seg_durs: dict[str, list[float]] = {l: [] for l in VTC_LABELS}
@@ -261,6 +314,12 @@ def _print_stats(
             print(f"    clips with mean SNR < {thresh:>2d} dB: "
                   f"{n_low:>4d} ({pct:.1f}%)")
 
+    if has_c50_data:
+        print(f"\n  C50 clarity per clip (dB) — mean:")
+        print(f"    {_fmt(c50_means)}")
+        print(f"  C50 per clip (dB) — intra-clip std:")
+        print(f"    {_fmt(c50_stds)}")
+
     print(f"\n  Speaker turns per clip:")
     print(f"    {_fmt(turns.astype(float))}")
 
@@ -345,6 +404,10 @@ def _print_stats(
         "snr_mins": snr_mins,
         "snr_maxs": snr_maxs,
         "has_snr_data": has_snr_data,
+        # C50
+        "c50_means": c50_means,
+        "c50_stds": c50_stds,
+        "has_c50_data": has_c50_data,
     }
 
 
@@ -431,6 +494,64 @@ def main() -> None:
     else:
         print("  WARN: no SNR data — clips will lack SNR metadata")
 
+    # Noise is optional (from PANNs pipeline)
+    noise_dir = ds.output / "noise"
+    has_noise = noise_dir.exists() and any(noise_dir.glob("*.npz"))
+    if has_noise:
+        print(f"  Noise data: {noise_dir}")
+    else:
+        print("  WARN: no noise data — clips will lack noise classification")
+
+    # --- Compare VAD vs VTC (integrated from compare pipeline) ---
+    vtc_dir_check = ds.output / "vtc_raw"
+    if has_vad and vtc_dir_check.exists():
+        print("\nVAD vs VTC comparison...")
+        vad_raw_df = load_parquet_dir(ds.output / "vad_raw")
+        vad_merged_df = load_parquet_dir(ds.output / "vad_merged")
+        vtc_raw_df = load_parquet_dir(ds.output / "vtc_raw")
+        vtc_merged_df = load_parquet_dir(ds.output / "vtc_merged")
+
+        # Build per-file metadata from VAD metadata
+        vad_meta_for_cmp = None
+        meta_path_cmp = ds.output / "vad_meta" / "metadata.parquet"
+        if meta_path_cmp.exists():
+            vad_meta_full_cmp = pl.read_parquet(meta_path_cmp)
+            vad_meta_for_cmp = vad_meta_full_cmp.select(
+                pl.col("file_id").str.replace(r"\.wav$", "").alias("uid"),
+                pl.col("duration").alias("file_total"),
+            )
+
+        vtc_meta_dir = ds.output / "vtc_meta"
+        vtc_meta_thresh = None
+        if vtc_meta_dir.exists():
+            vtc_meta_files = sorted(vtc_meta_dir.glob("*.parquet"))
+            if vtc_meta_files:
+                vtc_meta_thresh = pl.read_parquet(vtc_meta_files).select("uid", "vtc_threshold")
+
+        low_thresh = 0.3
+        results_raw = calculate_metrics(vad_raw_df, vtc_raw_df, vad_meta_for_cmp)
+        if vtc_meta_thresh is not None:
+            results_raw = results_raw.join(vtc_meta_thresh, on="uid", how="left")
+        stats_raw = print_summary(results_raw, "RAW: VAD vs VTC", low_thresh)
+        results_raw.write_csv(ds.output / "compare_raw.csv")
+
+        results_merged = calculate_metrics(vad_merged_df, vtc_merged_df, vad_meta_for_cmp)
+        if vtc_meta_thresh is not None:
+            results_merged = results_merged.join(vtc_meta_thresh, on="uid", how="left")
+        stats_merged = print_summary(results_merged, "MERGED: VAD vs VTC", low_thresh)
+        results_merged.write_csv(ds.output / "compare_merged.csv")
+
+        fig_dir_cmp = ds.figures
+        if vad_meta_for_cmp is not None:
+            results_raw = results_raw.join(vad_meta_for_cmp.select("uid", "file_total"), on="uid", how="left")
+            results_merged = results_merged.join(vad_meta_for_cmp.select("uid", "file_total"), on="uid", how="left")
+
+        plot_dashboard(results_raw, stats_raw, "RAW: VAD vs VTC", fig_dir_cmp / "compare_raw.png", low_thresh, target_iou=0.9)
+        plot_dashboard(results_merged, stats_merged, "MERGED: VAD vs VTC", fig_dir_cmp / "compare_merged.png", low_thresh, target_iou=0.9)
+
+        diag = diagnose_low_iou(results_merged, vtc_merged_df, low_thresh)
+        diag.write_csv(ds.output / "diagnostics.csv")
+
     # --- Build clips for each file ---
     t0 = time.time()
     all_clips: list[tuple[str, Path, int, Clip]] = []
@@ -443,8 +564,9 @@ def main() -> None:
 
         vtc_segs = _load_vtc_segments(ds.output, uid)
         vad_segs = _load_vad_segments(ds.output, uid) if has_vad else []
-        file_snr, snr_step = _load_snr(ds.output, uid) if has_snr else (None, 1.0)
-        file_dur = _get_file_duration(ds.metadata, uid)
+        file_snr, file_c50, snr_step = _load_snr(ds.output, uid) if has_snr else (None, None, 1.0)
+        file_noise, noise_cats, noise_step = _load_noise(ds.output, uid) if has_noise else (None, [], 1.0)
+        file_dur = _get_file_duration(ds.output, uid)
 
         if file_dur is None:
             print(f"  WARN: no metadata for {uid}, skipping")
@@ -467,6 +589,16 @@ def main() -> None:
                     file_snr, snr_step, clip.abs_onset, clip.abs_offset,
                 )
                 clip.snr_step_s = snr_step
+            if file_c50 is not None:
+                clip.c50_array = _slice_snr_for_clip(
+                    file_c50, snr_step, clip.abs_onset, clip.abs_offset,
+                )
+            if file_noise is not None:
+                clip.noise_array = _slice_noise_for_clip(
+                    file_noise, noise_step, clip.abs_onset, clip.abs_offset,
+                )
+                clip.noise_categories = noise_cats
+                clip.noise_step_s = noise_step
             all_clips.append((uid, audio_path, idx, clip))
 
     clip_time = time.time() - t0
@@ -484,6 +616,16 @@ def main() -> None:
     fig_dir = Path("figures") / args.dataset
     save_figure(stats, fig_dir / "clip_summary.png")
     save_label_figures(stats, fig_dir / "label_analysis.png")
+
+    # --- Build intermediate DataFrames & dashboard ---
+    t_stats = time.time()
+    dfs = save_all_stats(all_clips, ds.output, global_tier_counts)
+    print(f"  Stats computed in {time.time() - t_stats:.1f}s")
+
+    print("Rendering dashboard...", flush=True)
+    t_dash = time.time()
+    save_all_dashboard_figures(dfs, global_tier_counts, fig_dir / "dashboard")
+    print(f"  Dashboard rendered in {time.time() - t_dash:.1f}s")
 
     # --- Write shards ---
     print("Writing shards...", flush=True)
@@ -512,6 +654,7 @@ def main() -> None:
         meta.pop("vad_segments", None)
         meta.pop("vtc_segments", None)
         meta.pop("snr", None)  # array too large for CSV; kept in JSON
+        meta.pop("c50", None)  # array too large for CSV; kept in JSON
         # Flatten nested types for CSV compatibility
         meta["labels_present"] = ";".join(meta.get("labels_present", []))
         ld = meta.pop("label_durations", {})

@@ -145,6 +145,11 @@ def write_shards(
                 snr_buf = io.BytesIO()
                 np.save(snr_buf, clip.snr_array)
                 sample["snr.npy"] = snr_buf.getvalue()
+            # Add C50 array
+            if clip.c50_array is not None:
+                c50_buf = io.BytesIO()
+                np.save(c50_buf, clip.c50_array)
+                sample["c50.npy"] = c50_buf.getvalue()
             sink.write(sample)  # type: ignore
             count_in_shard += 1
 

@@ -1,7 +1,7 @@
 #!/bin/bash
-#SBATCH --job-name=snr_brouhaha
-#SBATCH --output=logs/snr/snr_%A_%a.out
-#SBATCH --error=logs/snr/snr_%A_%a.err
+#SBATCH --job-name=noise_panns
+#SBATCH --output=logs/noise/noise_%A_%a.out
+#SBATCH --error=logs/noise/noise_%A_%a.err
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=32G
 #SBATCH --time=24:00:00
@@ -10,17 +10,16 @@
 #SBATCH --array=0-1
 
 DATASET="$1"
-shift 1  # remaining args passed through to snr.py
+shift 1  # remaining args passed through to noise.py
 
 if [ -z "$DATASET" ]; then
-    echo "Usage: sbatch snr.slurm <DATASET> [ADDITIONAL_ARGS...]"
-    echo "Example: sbatch snr.slurm chunks30"
-    echo "Example: sbatch snr.slurm chunks30 --pool_window 0.5"
+    echo "Usage: sbatch noise.slurm <DATASET> [ADDITIONAL_ARGS...]"
+    echo "Example: sbatch noise.slurm seedlings_10"
     exit 1
 fi
 
 echo ""
-echo "Brouhaha SNR Extraction"
+echo "PANNs Noise Classification"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "Job: ${SLURM_ARRAY_JOB_ID}_${SLURM_ARRAY_TASK_ID}  Node: $(hostname)"
 echo "Shard: ${SLURM_ARRAY_TASK_ID}/$((SLURM_ARRAY_TASK_COUNT-1))"
@@ -35,10 +34,8 @@ module load ffmpeg
 
 echo ""
 
-mkdir -p logs/snr
-
 PYTHONUNBUFFERED=1 \
-uv run src/pipeline/snr.py "$DATASET" \
+uv run src/pipeline/noise.py "$DATASET" \
     --array_id "$SLURM_ARRAY_TASK_ID" \
     --array_count "$SLURM_ARRAY_TASK_COUNT" \
     "$@"

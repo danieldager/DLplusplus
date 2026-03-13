@@ -12,15 +12,18 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import _TORCHCODEC_OK, _TENVAD_OK, requires_tenvad, requires_torchcodec
+from tests.conftest import (
+    _TORCHCODEC_OK,
+    _TENVAD_OK,
+    requires_tenvad,
+    requires_torchcodec,
+)
 
 # Guard torchcodec-dependent imports so the module can still be *collected*
 # on login nodes where FFmpeg/torchcodec is unavailable.
 if _TORCHCODEC_OK:
-    from src.core.regions import (
-        forward_pass_full_file,
-        merge_into_activity_regions,
-    )
+    import torch
+    from segma.inference import apply_model_on_audio
 
 if _TENVAD_OK:
     from src.core.vad_processing import process_vad_file, set_seeds
@@ -54,14 +57,14 @@ class TestVadReproducibility:
             "n_speech_segments",
             "n_silence_segments",
         ):
-            assert meta_a[key] == meta_b[key], (
-                f"Metadata mismatch on '{key}': {meta_a[key]} vs {meta_b[key]}"
-            )
+            assert (
+                meta_a[key] == meta_b[key]
+            ), f"Metadata mismatch on '{key}': {meta_a[key]} vs {meta_b[key]}"
 
         # Segment-level exact match
-        assert len(segs_a) == len(segs_b), (
-            f"Segment count mismatch: {len(segs_a)} vs {len(segs_b)}"
-        )
+        assert len(segs_a) == len(
+            segs_b
+        ), f"Segment count mismatch: {len(segs_a)} vs {len(segs_b)}"
         for i, (sa, sb) in enumerate(zip(segs_a, segs_b)):
             assert sa == sb, f"Segment {i} differs: {sa} vs {sb}"
 
@@ -77,13 +80,11 @@ class TestVadReproducibility:
             meta_b, segs_b = process_vad_file(args)
 
             assert meta_a["success"] is True
-            assert len(segs_a) == len(segs_b), (
-                f"{wav.stem}: segment count {len(segs_a)} vs {len(segs_b)}"
-            )
+            assert len(segs_a) == len(
+                segs_b
+            ), f"{wav.stem}: segment count {len(segs_a)} vs {len(segs_b)}"
             for i, (sa, sb) in enumerate(zip(segs_a, segs_b)):
-                assert sa == sb, (
-                    f"{wav.stem} segment {i}: {sa} vs {sb}"
-                )
+                assert sa == sb, f"{wav.stem} segment {i}: {sa} vs {sb}"
 
     def test_silence_file_deterministic(self, silence_wav: Path):
         """Silence file is deterministic (edge case: zero or few segments)."""
@@ -186,54 +187,54 @@ class TestVtcReproducibility:
         wav = good_book_wavs[0]
 
         self._set_seeds(42)
-        result_a = forward_pass_full_file(
-            wav,
-            self.model,
-            self.conv_settings,
-            self.device,
-            batch_size=128,
-            chunk_duration_s=self.chunk_duration_s,
-        )
+        with torch.no_grad():
+            logits_a = apply_model_on_audio(
+                audio_path=wav,
+                model=self.model,
+                conv_settings=self.conv_settings,
+                device=self.device,  # type: ignore
+                batch_size=128,
+                chunk_duration_s=self.chunk_duration_s,
+            )
 
         self._set_seeds(42)
-        result_b = forward_pass_full_file(
-            wav,
-            self.model,
-            self.conv_settings,
-            self.device,
-            batch_size=128,
-            chunk_duration_s=self.chunk_duration_s,
-        )
-
-        assert len(result_a) == len(result_b)
-        for (off_a, lg_a), (off_b, lg_b) in zip(result_a, result_b):
-            assert off_a == off_b, f"Region offset mismatch: {off_a} vs {off_b}"
-            assert torch.equal(lg_a, lg_b), (
-                f"Logit mismatch: max diff = "
-                f"{(lg_a - lg_b).abs().max().item():.6e}"
+        with torch.no_grad():
+            logits_b = apply_model_on_audio(
+                audio_path=wav,
+                model=self.model,
+                conv_settings=self.conv_settings,
+                device=self.device,  # type: ignore
+                batch_size=128,
+                chunk_duration_s=self.chunk_duration_s,
             )
+
+        assert torch.equal(logits_a, logits_b), (
+            f"Logit mismatch: max diff = "
+            f"{(logits_a - logits_b).abs().max().item():.6e}"
+        )
 
     def test_segments_deterministic(self, good_book_wavs: list[Path]):
         """Full VTC pipeline (forward + threshold) yields identical segments."""
         import torch
 
         from src.core.intervals import intervals_to_segments
-        from src.core.thresholds import apply_default_threshold_regions
+        from src.pipeline.vtc import _apply_threshold
 
         wav = good_book_wavs[0]
 
         def _run():
             self._set_seeds(42)
-            region_data = forward_pass_full_file(
-                wav,
-                self.model,
-                self.conv_settings,
-                self.device,
-                batch_size=128,
-                chunk_duration_s=self.chunk_duration_s,
-            )
-            region_data_cpu = [(off, lg.cpu()) for off, lg in region_data]
-            intervals = apply_default_threshold_regions(
+            with torch.no_grad():
+                logits_t = apply_model_on_audio(
+                    audio_path=wav,
+                    model=self.model,
+                    conv_settings=self.conv_settings,
+                    device=self.device,  # type: ignore
+                    batch_size=128,
+                    chunk_duration_s=self.chunk_duration_s,
+                )
+            region_data_cpu = [(0, logits_t.cpu())]
+            intervals = _apply_threshold(
                 region_data_cpu,
                 threshold=0.5,
                 conv_settings=self.conv_settings,
@@ -244,8 +245,8 @@ class TestVtcReproducibility:
         segs_a = _run()
         segs_b = _run()
 
-        assert len(segs_a) == len(segs_b), (
-            f"Segment count: {len(segs_a)} vs {len(segs_b)}"
-        )
+        assert len(segs_a) == len(
+            segs_b
+        ), f"Segment count: {len(segs_a)} vs {len(segs_b)}"
         for i, (sa, sb) in enumerate(zip(segs_a, segs_b)):
             assert sa == sb, f"VTC segment {i}: {sa} vs {sb}"

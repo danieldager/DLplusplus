@@ -85,13 +85,10 @@ The pipeline runs four steps, each as a SLURM job:
 | Step | Module | Resource | Description |
 |------|--------|----------|-------------|
 | **1. VAD** | `src.pipeline.vad` | 48 CPUs | TenVAD speech detection (multiprocessed, ~31 MB/worker) |
-| **2. VTC** | `src.pipeline.vtc` | 4× GPU | VTC-2.0 inference with adaptive per-file thresholding |
-| **3. Compare** | `src.pipeline.compare` | 8 CPUs | Per-file IoU / Precision / Recall + diagnostic figures |
-| **4. Package** | `src.pipeline.package` | 4 CPUs | Tile full audio into ≤10-min clips → WebDataset shards |
-
-**Adaptive thresholding:** The VTC model was trained on child-directed speech. For out-of-distribution audio (e.g., audiobook narrators), the default 0.5 sigmoid threshold can miss speech that the model does partially detect. Step 2 uses VAD output to automatically lower the threshold per file until VTC–VAD agreement reaches 90% IoU.
-
-**Activity-region optimization:** For long recordings with sparse speech (< 90% coverage), VTC inference is restricted to speech-active regions only — cutting GPU time by up to 10×.
+| **2. VTC** | `src.pipeline.vtc` | 4× GPU | VTC-2.0 inference with fixed sigmoid threshold (default 0.5) |
+| **3. SNR** | `src.pipeline.snr` | 4× GPU | Brouhaha SNR/C50 extraction per audio file |
+| **4. Noise** | `src.pipeline.noise` | 4× GPU | PANNs CNN14 noise classification per audio file |
+| **5. Package** | `src.pipeline.package` | 4 CPUs | Tile audio into ≤10-min clips → WebDataset shards + dashboard |
 
 **Resume support:** Both VAD and VTC save checkpoints. Interrupted jobs can be resubmitted and will skip already-completed files.
 
@@ -123,42 +120,52 @@ Output:
 VTC/
 ├── src/
 │   ├── utils.py             # Shared utilities (manifest I/O, paths, logging)
+│   ├── compat.py            # Compatibility shims (torchaudio patches)
 │   ├── pipeline/            # CLI entry points (one per pipeline step)
 │   │   ├── vad.py           #   Step 1: Voice activity detection
 │   │   ├── vtc.py           #   Step 2: VTC inference
-│   │   ├── compare.py       #   Step 3: VAD vs VTC comparison
-│   │   ├── package.py       #   Step 4: Audio tiling + WebDataset shards
-│   │   ├── snr.py           #   Brouhaha SNR extraction
+│   │   ├── snr.py           #   Step 3: Brouhaha SNR/C50 extraction
+│   │   ├── noise.py         #   Step 4: PANNs CNN14 noise classification
+│   │   ├── package.py       #   Step 5: Audio tiling + WebDataset shards
+│   │   ├── compare.py       #   VAD vs VTC comparison helpers
 │   │   ├── normalize.py     #   Manifest normalization
 │   │   └── preflight.py     #   Pre-pipeline dataset scan
 │   ├── packaging/           # Clip building, shard writing, listener
 │   │   ├── clips.py         #   Clip tiling algorithm (6-tier fallback)
+│   │   ├── stats.py         #   Per-clip/file/conversation statistics
 │   │   ├── writer.py        #   WebDataset tar shard writer
 │   │   └── listener.py      #   Sample extraction for validation
-│   └── core/                # Reusable, tested modules
-│       ├── intervals.py     #   Interval arithmetic (merge, IoU)
-│       ├── regions.py       #   Activity-region optimization
-│       ├── thresholds.py    #   Adaptive threshold sweeping
-│       ├── vad_processing.py#   Per-file VAD (worker code)
-│       ├── parallel.py      #   Process pool driver with progress queue
-│       ├── checkpoint.py    #   Checkpoint save / resume
-│       └── metadata.py      #   VTC metadata constructors
+│   ├── core/                # Reusable, tested modules
+│   │   ├── intervals.py     #   Interval arithmetic (merge, IoU)
+│   │   ├── conversations.py #   Turn/conversation extraction
+│   │   ├── vad_processing.py#   Per-file VAD (worker code)
+│   │   ├── parallel.py      #   Process pool driver with progress queue
+│   │   ├── checkpoint.py    #   Checkpoint save / resume
+│   │   └── metadata.py      #   VTC metadata constructors
+│   └── plotting/            # Dashboard figure generation
+│       ├── dashboard.py     #   Orchestrator (calls sub-modules)
+│       ├── dashboard_snr.py #   SNR quality + noise environment pages
+│       ├── dashboard_speech.py # Conversation + turns pages
+│       ├── dashboard_overview.py # Overview + correlation + text summary
+│       └── packaging.py     #   Per-clip/label summary grids
 ├── slurm/
 │   ├── pipeline.sh          # One-command pipeline orchestrator
 │   ├── vad.slurm            # SLURM: VAD (CPU, 48 workers)
 │   ├── vtc.slurm            # SLURM: VTC (GPU array, 4 shards)
-│   ├── compare.slurm        # SLURM: Compare (CPU)
+│   ├── snr.slurm            # SLURM: Brouhaha SNR (GPU)
+│   ├── noise.slurm          # SLURM: PANNs noise (GPU)
 │   ├── package_test.sh      # SLURM: End-to-end packaging test
 │   └── test.slurm           # SLURM: pytest on compute node
 ├── tests/                   # pytest suite covering all core modules
-│   ├── conftest.py          #   Stitched audio fixtures
-│   ├── fixtures/            #   Synthetic WAV files (committed)
+│   ├── conftest.py          #   Audio fixtures + skip markers
+│   ├── fixtures/            #   Short WAV files (committed)
 │   ├── test_intervals.py
-│   ├── test_regions.py
 │   ├── test_checkpoint.py
 │   ├── test_metadata.py
 │   ├── test_parallel.py
 │   ├── test_clips.py        #   Clip tiling + tier fallback chain
+│   ├── test_snr.py          #   Brouhaha SNR extraction
+│   ├── test_noise.py        #   PANNs noise classification
 │   ├── test_vad_processing.py
 │   ├── test_reproducibility.py
 │   └── test_stitched_audio.py

@@ -1,9 +1,10 @@
 # VTC Test Suite
 
-Tests for the `src/core/` and `src/packaging/` modules. Covers pure interval
-arithmetic, VAD processing helpers, activity-region logic, checkpoint I/O,
-metadata row construction, parallel VAD execution, clip tiling, end-to-end VAD
-integration on real speech, and reproducibility.
+Tests for the `src/core/`, `src/pipeline/`, and `src/packaging/` modules.
+Covers pure interval arithmetic, VAD processing helpers, SNR extraction,
+noise classification, checkpoint I/O, metadata row construction, parallel VAD
+execution, clip tiling, end-to-end VAD integration on real speech, and
+reproducibility.
 
 ---
 
@@ -99,19 +100,6 @@ Tests `src/packaging/clips.py`. Pure-Python — runs on the login node.
 
 ---
 
-### `test_regions.py` — Activity-region construction
-
-Tests `src/core/regions.py`. Requires `torchcodec`/FFmpeg to import.
-The tests exercise the pure-Python `merge_into_activity_regions` and
-`activity_region_coverage` functions — no model is loaded.
-
-| Test class | What it verifies |
-|---|---|
-| `TestMergeIntoActivityRegions` | Padding clipped to `[0, file_duration]`. Segments within `merge_gap_s` collapse; distant segments stay separate. |
-| `TestActivityRegionCoverage` | Coverage fraction arithmetic: empty → 0.0, full → 1.0, zero-duration file → 1.0. |
-
----
-
 ### `test_vad_processing.py` — VAD helper functions
 
 Tests `src/core/vad_processing.py`. Pure-logic tests run on the login node.
@@ -171,6 +159,35 @@ silence files) without depending on specific numeric thresholds.
 
 ---
 
+### `test_snr.py` — Brouhaha SNR extraction
+
+Tests `src/pipeline/snr.py`. Pure-numpy tests run on the login node.
+GPU/model tests require Brouhaha (pyannote) and skip otherwise.
+
+| Test class | What it verifies | Brouhaha? |
+|---|---|---|
+| `TestPoolSnr` | `pool_snr` aggregation: mean/median/percentile pooling, NaN handling, empty arrays, dtype. | No |
+| `TestExtractSnr` | `_extract_snr` output schema, segment-level SNR values, short-file edge case. | **Yes** |
+| `TestSnrRoundTrip` | End-to-end: WAV → extract → pool → stats are plausible. | **Yes** |
+| `TestSnrReproducibility` | Bit-identical SNR values across reruns with fixed seeds. | **Yes** |
+
+---
+
+### `test_noise.py` — PANNs noise classification
+
+Tests `src/pipeline/noise.py`. Pure-numpy tests run on the login node.
+GPU/model tests require PANNs CNN14 and skip otherwise.
+
+| Test class | What it verifies | PANNs? |
+|---|---|---|
+| `TestMapToCategories` | `map_to_categories` mapping from AudioSet labels to noise categories. | No |
+| `TestPoolNoise` | `pool_noise` aggregation over frame-level logits. | No |
+| `TestPoolToCategories` | `pool_to_categories` top-k category extraction. | No |
+| `TestClipNoiseIntegration` | End-to-end clip-level noise classification on synthetic data. | No |
+| `TestExtractPanns` | `extract_panns` output schema, real audio inference. | **Yes** |
+
+---
+
 ### `test_reproducibility.py` — Deterministic pipeline outputs
 
 Verifies bit-identical results across reruns using `set_seeds(42)`.
@@ -189,5 +206,5 @@ Verifies bit-identical results across reruns using `set_seeds(42)`.
 - **Collection fixtures**: `all_fixture_wavs` (all 5), `speech_fixture_wavs`
   (3 with speech), `good_book_wavs` (backward-compat alias).
 - **`test_manifest`**: writes a manifest CSV for all fixture WAVs.
-- **`requires_tenvad`** / **`requires_torchcodec`**: skip markers with
-  human-readable reasons.
+- **`requires_tenvad`** / **`requires_torchcodec`** / **`requires_brouhaha`**:
+  skip markers with human-readable reasons.

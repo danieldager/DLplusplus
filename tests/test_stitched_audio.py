@@ -1,10 +1,9 @@
 """Integration tests — end-to-end VAD on real speech fixtures.
 
-Tests the contract of process_vad_file and activity-region logic using
-real LibriVox speech clips.  Assertions
-check output schemas and directional properties (speech files have higher
-ratios than silence files) without requiring specific numeric thresholds
-that depend on TenVAD's internal model.
+Tests the contract of process_vad_file using real LibriVox speech clips.
+Assertions check output schemas and directional properties (speech files
+have higher ratios than silence files) without requiring specific numeric
+thresholds that depend on TenVAD's internal model.
 
 Fixtures (from conftest.py):
   speech_clean.wav        6.0s  dense single-speaker (MAL)
@@ -25,17 +24,13 @@ import pytest
 import soundfile as sf
 
 from tests.conftest import (
-    _TORCHCODEC_OK,
     _TENVAD_OK,
     requires_tenvad,
-    requires_torchcodec,
 )
 
-# Guard heavy imports — TenVAD and torchcodec may not be available on login nodes.
-# Use TYPE_CHECKING block so the type checker always sees the real signatures.
+# Guard heavy imports — TenVAD may not be available on login nodes.
 if TYPE_CHECKING:
     from src.core.vad_processing import process_vad_file
-    from src.core.regions import activity_region_coverage, merge_into_activity_regions
 
 if _TENVAD_OK:
     from src.core.vad_processing import process_vad_file
@@ -43,29 +38,6 @@ else:
 
     def process_vad_file(args: Any) -> Any:  # type: ignore[misc]
         raise RuntimeError("TenVAD unavailable")
-
-
-if _TORCHCODEC_OK:
-    from src.core.regions import (
-        activity_region_coverage,
-        merge_into_activity_regions,
-    )
-else:
-
-    def merge_into_activity_regions(  # type: ignore[misc]
-        vad_pairs: Any,
-        file_duration_s: Any,
-        merge_gap_s: float = 30.0,
-        pad_s: float = 5.0,
-    ) -> Any:
-        raise RuntimeError("torchcodec unavailable")
-
-    def activity_region_coverage(  # type: ignore[misc]
-        regions: Any,
-        file_duration_s: Any,
-    ) -> Any:
-        raise RuntimeError("torchcodec unavailable")
-
 
 # ---------------------------------------------------------------------------
 # Fixture validation (no TenVAD needed — just checks files exist & are valid)
@@ -246,78 +218,3 @@ class TestVadIntegration:
             f"Long speech ratio {long_meta['speech_ratio']:.3f} should exceed "
             f"silence ratio {silence_meta['speech_ratio']:.3f}"
         )
-
-
-# ---------------------------------------------------------------------------
-# Activity regions — tested with injected VAD output (deterministic)
-# ---------------------------------------------------------------------------
-
-
-@requires_tenvad
-@requires_torchcodec
-class TestActivityRegionsIntegration:
-    """Test activity-region logic using real VAD output from fixture files."""
-
-    def test_speech_file_produces_regions(self, speech_clean_wav: Path):
-        """Speech file → VAD → activity regions cover a meaningful portion."""
-        meta, segs = process_vad_file((speech_clean_wav, 256, 0.5))
-        assert meta["success"] is True
-
-        vad_pairs = [(s["onset"], s["offset"]) for s in segs]
-        regions = merge_into_activity_regions(vad_pairs, meta["duration"])
-        coverage = activity_region_coverage(regions, meta["duration"])
-
-        assert len(regions) >= 1
-        assert coverage > 0, f"Expected coverage > 0, got {coverage:.2f}"
-
-    def test_silence_file_low_coverage(self, silence_wav: Path):
-        """Silence file → VAD → activity regions cover little or nothing."""
-        meta, segs = process_vad_file((silence_wav, 256, 0.5))
-        assert meta["success"] is True
-
-        vad_pairs = [(s["onset"], s["offset"]) for s in segs]
-        regions = merge_into_activity_regions(vad_pairs, meta["duration"])
-        coverage = activity_region_coverage(regions, meta["duration"])
-
-        # Silence file may have zero or very few regions
-        assert (
-            coverage < 0.5
-        ), f"Expected coverage < 0.5 for silence, got {coverage:.2f}"
-
-    def test_sparse_file_separable_regions(self, speech_sparse_wav: Path):
-        """Sparse-speech file → should produce few or small regions."""
-        meta, segs = process_vad_file((speech_sparse_wav, 256, 0.5))
-        assert meta["success"] is True
-
-        vad_pairs = [(s["onset"], s["offset"]) for s in segs]
-        regions = merge_into_activity_regions(vad_pairs, meta["duration"])
-        coverage = activity_region_coverage(regions, meta["duration"])
-
-        # Sparse file (~2.5% speech) should have low coverage
-        assert coverage < 0.8, f"Expected coverage < 0.8, got {coverage:.2f}"
-
-    def test_long_file_produces_regions(self, speech_long_wav: Path):
-        """27s dense speech → meaningful activity region coverage."""
-        meta, segs = process_vad_file((speech_long_wav, 256, 0.5))
-        assert meta["success"] is True
-
-        vad_pairs = [(s["onset"], s["offset"]) for s in segs]
-        regions = merge_into_activity_regions(vad_pairs, meta["duration"])
-        coverage = activity_region_coverage(regions, meta["duration"])
-
-        assert len(regions) >= 1
-        assert coverage > 0, f"Expected coverage > 0 for 27s speech, got {coverage:.2f}"
-
-    def test_long_multi_produces_regions(self, speech_long_multi_wav: Path):
-        """63s multi-speaker → meaningful activity region coverage."""
-        meta, segs = process_vad_file((speech_long_multi_wav, 256, 0.5))
-        assert meta["success"] is True
-
-        vad_pairs = [(s["onset"], s["offset"]) for s in segs]
-        regions = merge_into_activity_regions(vad_pairs, meta["duration"])
-        coverage = activity_region_coverage(regions, meta["duration"])
-
-        assert len(regions) >= 1
-        assert (
-            coverage > 0
-        ), f"Expected coverage > 0 for 63s multi-speaker, got {coverage:.2f}"

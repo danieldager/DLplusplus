@@ -38,6 +38,7 @@ from src.utils import (
     add_sample_argument,
     atomic_write_parquet,
     get_dataset_paths,
+    hhmmss,
     load_manifest,
     log_benchmark,
     sample_manifest,
@@ -79,32 +80,27 @@ def _ensure_model(model_path: str) -> str:
     return model_path
 
 
-def _hhmmss(seconds: float) -> str:
-    """Format seconds as HH:MM:SS."""
-    h, rem = divmod(int(seconds), 3600)
-    m, s = divmod(rem, 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
-
-
 # ------------------------------------------------------------------
 # SNR extraction helpers
 # ------------------------------------------------------------------
 
 
-def _extract_snr(
+def _extract_brouhaha(
     pipeline,
     audio_path: Path,
-) -> tuple[np.ndarray, float]:
-    """Run Brouhaha on one file and return (raw_snr, step_s).
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Run Brouhaha on one file and return (raw_snr, raw_c50, step_s).
 
     Returns
     -------
-    raw_snr : 1-D float32 array of per-frame SNR values.
+    raw_snr : 1-D float32 array of per-frame SNR values (dB).
+    raw_c50 : 1-D float32 array of per-frame C50 clarity values (dB).
     step_s  : Frame step in seconds (from the model's receptive field).
     """
     file = {"uri": audio_path.stem, "audio": str(audio_path)}
     output = pipeline(file)
     snr: np.ndarray = output["snr"]  # (n_frames,) float
+    c50: np.ndarray = output["c50"]  # (n_frames,) float
 
     # Resolve the frame step from the underlying model
     seg = pipeline._segmentation
@@ -120,7 +116,16 @@ def _extract_snr(
         info = sf.info(str(audio_path))
         step_s = info.duration / max(len(snr), 1)
 
-    return snr.astype(np.float32), step_s
+    return snr.astype(np.float32), c50.astype(np.float32), step_s
+
+
+# Keep backward-compatible alias
+def _extract_snr(
+    pipeline, audio_path: Path,
+) -> tuple[np.ndarray, float]:
+    """Backward-compatible wrapper — returns (snr, step_s) only."""
+    snr, _c50, step_s = _extract_brouhaha(pipeline, audio_path)
+    return snr, step_s
 
 
 def pool_snr(
@@ -176,6 +181,9 @@ def main(
     array_count: int | None = None,
     sample: int | float | None = None,
 ):
+    import warnings
+    # Suppress PyTorch TF32 deprecation warning from set_seeds()
+    warnings.filterwarnings("ignore", message=".*TF32.*deprecated.*")
     set_seeds(42)
 
     paths = get_dataset_paths(dataset)
@@ -244,11 +252,30 @@ def main(
     import torch
     from src.compat import patch_torchaudio
     patch_torchaudio()
+
+    # Silence noisy third-party warnings during model load:
+    #   - speechbrain checkpoint hooks / quirks (INFO-level spam)
+    #   - pytorch_lightning checkpoint upgrade notice
+    #   - pyannote version-mismatch warnings (bare print)
+    #   - brouhaha "Using default parameters" (bare print)
+    import io
+    for _mod in ("speechbrain", "pytorch_lightning", "lightning",
+                 "lightning.fabric", "lightning_fabric"):
+        logging.getLogger(_mod).setLevel(logging.WARNING)
+
     from pyannote.audio import Model
     from brouhaha.pipeline import RegressiveActivityDetectionPipeline
 
     logger.info(f"Model: {model_path}")
-    model = Model.from_pretrained(Path(model_path), strict=False)
+    # Redirect stdout to swallow bare print() from pyannote + brouhaha
+    _real_stdout = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            model = Model.from_pretrained(Path(model_path), strict=False)
+    finally:
+        sys.stdout = _real_stdout
 
     if model.device.type == "cpu" and device != "cpu":
         dev = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -257,7 +284,18 @@ def main(
     else:
         logger.info(f"Device: {model.device}")
 
-    pipeline = RegressiveActivityDetectionPipeline(segmentation=model)
+    # Pipeline init triggers "Using default parameters" print — suppress it
+    sys.stdout = io.StringIO()
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            pipeline = RegressiveActivityDetectionPipeline(segmentation=model)
+    finally:
+        sys.stdout = _real_stdout
+
+    # Suppress recurring runtime warnings from pyannote / torchaudio
+    warnings.filterwarnings("ignore", module=r"pyannote\.audio")
+    warnings.filterwarnings("ignore", message=".*backend.*parameter.*not used.*")
 
     # Resolve model frame step for logging
     seg = pipeline._segmentation
@@ -300,13 +338,15 @@ def main(
         audio_path = Path(uid_to_path[uid])
 
         try:
-            raw_snr, step_s = _extract_snr(pipeline, audio_path)
-            pooled, pool_step = pool_snr(raw_snr, step_s, pool_window)
+            raw_snr, raw_c50, step_s = _extract_brouhaha(pipeline, audio_path)
+            pooled_snr, pool_step = pool_snr(raw_snr, step_s, pool_window)
+            pooled_c50, _ = pool_snr(raw_c50, step_s, pool_window)
 
-            # Save pooled SNR
+            # Save pooled SNR + C50
             np.savez_compressed(
                 snr_dir / f"{uid}.npz",
-                snr=pooled,
+                snr=pooled_snr,
+                c50=pooled_c50,
                 pool_step_s=np.float32(pool_step),
                 model_step_s=np.float32(step_s),
                 n_raw_frames=np.int32(len(raw_snr)),
@@ -320,13 +360,17 @@ def main(
                 "snr_status": "ok",
                 "duration": round(file_dur, 3),
                 "n_raw_frames": len(raw_snr),
-                "n_pooled_frames": len(pooled),
+                "n_pooled_frames": len(pooled_snr),
                 "model_step_s": round(step_s, 6),
                 "pool_step_s": round(pool_step, 6),
                 "snr_mean": round(float(raw_snr.mean()), 2),
                 "snr_std": round(float(raw_snr.std()), 2),
                 "snr_min": round(float(raw_snr.min()), 2),
                 "snr_max": round(float(raw_snr.max()), 2),
+                "c50_mean": round(float(raw_c50.mean()), 2),
+                "c50_std": round(float(raw_c50.std()), 2),
+                "c50_min": round(float(raw_c50.min()), 2),
+                "c50_max": round(float(raw_c50.max()), 2),
                 "error": "",
             })
 
@@ -345,6 +389,10 @@ def main(
                 "snr_std": 0.0,
                 "snr_min": 0.0,
                 "snr_max": 0.0,
+                "c50_mean": 0.0,
+                "c50_std": 0.0,
+                "c50_min": 0.0,
+                "c50_max": 0.0,
                 "error": str(e),
             })
 
@@ -422,7 +470,7 @@ def main(
                 f"  Pooled    : {ok['n_pooled_frames'].sum():,} frames "
                 f"({pool_window}s windows)"
             )
-    logger.info(f"  Wall time : {_hhmmss(wall)}")
+    logger.info(f"  Wall time : {hhmmss(wall)}")
     logger.info(f"{'─' * 50}")
 
     # ------------------------------------------------------------------
@@ -458,7 +506,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "dataset",
-        help="Dataset name — used to derive output/, metadata/, and figures/ directories.",
+        help="Dataset name — used to derive output/ and figures/ directories.",
     )
     parser.add_argument(
         "--model_path",
