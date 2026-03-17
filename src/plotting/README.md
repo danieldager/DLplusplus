@@ -39,7 +39,7 @@ All written to `figures/<dataset>/dashboard/`.
 8. C50 clarity histogram
 9. Conversation-level SNR histogram
 
-*Source: `dashboard_snr.py → save_snr_figures`*
+*Source: `snr_noise.py → save_snr_figures`*
 
 ### Page 2 — `conversation_structure.png` · Conversational Structure (3×3)
 
@@ -53,7 +53,7 @@ All written to `figures/<dataset>/dashboard/`.
 8. Inter-conversation silence histogram
 9. SNR vs child fraction scatter
 
-*Source: `dashboard_speech.py → save_conversation_figures`*
+*Source: `speech_turns.py → save_conversation_figures`*
 
 ### Page 3 — `turns_conversations.png` · Turns & Conversations (3×3)
 
@@ -67,7 +67,7 @@ All written to `figures/<dataset>/dashboard/`.
 8. Inter-conversation duration histogram
 9. Conversation SNR & C50 dual histogram
 
-*Source: `dashboard_speech.py → save_boss_figures`*
+*Source: `speech_turns.py → save_boss_figures`*
 
 ### Page 4 — `dataset_overview.png` · Dataset Overview + Cut Quality (3×3)
 
@@ -81,13 +81,13 @@ All written to `figures/<dataset>/dashboard/`.
 8. Speech density per clip
 9. Dataset summary text card
 
-*Source: `dashboard_overview.py → save_overview_figures`*
+*Source: `overview.py → save_overview_figures`*
 
 ### Page 5 — `correlation_matrix.png` · Correlation Matrix
 
 Single heatmap of Pearson correlations across all numeric clip metrics.
 
-*Source: `dashboard_overview.py → save_correlation_figure`*
+*Source: `overview.py → save_correlation_figure`*
 
 ### Page 6 — `noise_environment.png` · Noise Environment (3×3)
 
@@ -103,14 +103,14 @@ Only rendered when `noise_*` columns are present (i.e. PANNs was run).
 8. Noise-type co-occurrence matrix
 9. Per-segment noise vs duration scatter
 
-*Source: `dashboard_snr.py → save_noise_figures`*
+*Source: `snr_noise.py → save_noise_figures`*
 
 ## Regenerating plots
 
 ```python
 import polars as pl
 from pathlib import Path
-from src.plotting.dashboard import save_all_dashboard_figures
+from src.plotting.figures import save_all_figures
 
 dataset = "seedlings_10"
 stats_dir = Path(f"output/{dataset}/stats")
@@ -127,7 +127,7 @@ dfs = {
 import json
 tier_counts = json.loads((stats_dir / "tier_counts.json").read_text())
 
-save_all_dashboard_figures(
+save_all_figures(
     dfs, tier_counts, Path(f"figures/{dataset}/dashboard")
 )
 ```
@@ -138,7 +138,7 @@ Run it:
 uv run python -c "
 import polars as pl
 from pathlib import Path
-from src.plotting.dashboard import save_all_dashboard_figures
+from src.plotting.figures import save_all_figures
 
 dataset = 'seedlings_10'
 stats_dir = Path(f'output/{dataset}/stats')
@@ -148,7 +148,7 @@ dfs = {n: pl.read_parquet(stats_dir / f'{n}.parquet')
                  'conversation_stats','transition_stats',
                  'file_stats','correlation']}
 tier_counts = json.loads((stats_dir / 'tier_counts.json').read_text())
-save_all_dashboard_figures(dfs, tier_counts, Path(f'figures/{dataset}/dashboard'))
+save_all_figures(dfs, tier_counts, Path(f'figures/{dataset}/dashboard'))
 print('Done — check figures/{dataset}/dashboard/')
 "
 ```
@@ -159,9 +159,8 @@ print('Done — check figures/{dataset}/dashboard/')
 ## Module structure
 
 | Module | Purpose |
-|--------|---------||
-| `dashboard.py` | Orchestrator — `save_all_dashboard_figures` delegates to sub-modules |
-| `dashboard_snr.py` | Pages 1 & 6 — SNR quality + noise environment |
-| `dashboard_speech.py` | Pages 2 & 3 — conversational structure + turns |
-| `dashboard_overview.py` | Pages 4 & 5 — dataset overview + correlation matrix + text summary |
-| `packaging.py` | `save_figure()` / `save_label_figures()` — per-clip and per-label summary grids (in-memory stats, not regenerable from parquets) |
+|--------|---------|
+| `figures.py` | Orchestrator — `save_all_figures` delegates to sub-modules |
+| `snr_noise.py` | Pages 1 & 6 — SNR quality + noise environment |
+| `speech_turns.py` | Pages 2 & 3 — conversational structure + turns |
+| `overview.py` | Pages 4 & 5 — dataset overview + correlation matrix + text summary |

@@ -78,7 +78,7 @@ Process an entire dataset end-to-end (VAD → VTC → comparison metrics):
 ```bash
 # First run with a custom manifest:
 bash slurm/pipeline.sh my_data \
-    --manifest /data/recordings.parquet \
+    --manifest manifests/my_dataset.parquet \
     --path-col audio_path \
     --audio-root /store/audio/
 
@@ -94,13 +94,13 @@ This submits three chained SLURM jobs with automatic dependency handling. See th
 
 The pipeline runs four steps, each as a SLURM job:
 
-| Step | Module | Resource | Description |
-|------|--------|----------|-------------|
-| **1. VAD** | `src.pipeline.vad` | CPU | TenVAD speech detection (multiprocessed, ~31 MB/worker) |
-| **2. VTC** | `src.pipeline.vtc` | GPU | VTC-2.0 inference with default threshold (0.5) |
-| **3. SNR** | `src.pipeline.snr` | GPU | Brouhaha SNR/C50 extraction per audio file |
-| **4. Noise** | `src.pipeline.noise` | GPU | PANNs CNN14 noise classification per audio file |
-| **5. Package** | `src.pipeline.package` | CPU | ≤10-min clipping → WebDataset shards + plots |
+|  Step  | Module | Resource | Description |
+|--------|--------|----------|-------------|
+| **1. VAD** | `src.pipeline.vad` | CPU | TenVAD speech detection |
+| **2. VTC** | `src.pipeline.vtc` | GPU | VTC-2.0 inference (diarization) |
+| **3. SNR** | `src.pipeline.snr` | GPU | Brouhaha SNR/C50 extraction |
+| **4. Noise** | `src.pipeline.noise` | GPU | PANNs CNN14 noise classification |
+| **5. Package** | `src.pipeline.package` | CPU | Clipping + WebDataset + figures |
 
 **Resume support:** Both VAD and VTC save checkpoints. Interrupted jobs can be resubmitted and will skip already-completed files.
 
@@ -130,16 +130,16 @@ Each clip in a shard is stored as up to four files sharing the key `{uid}_{clip_
 
 | File | Format | Contents |
 |------|--------|----------|
-| `{clip_id}.flac` / `.wav` | FLAC / WAV | Mono audio, 16 kHz |
+| `{clip_id}.wav` / `.flac` | WAV / FLAC | Mono audio, 16 kHz |
 | `{clip_id}.json` | JSON (UTF-8) | All scalar + structured metadata (see below) |
-| `{clip_id}.snr.npy` | NumPy float16 | Time-series SNR values per `snr_step_s` window *(optional)* |
-| `{clip_id}.c50.npy` | NumPy float16 | Time-series C50 values per `snr_step_s` window *(optional)* |
+| `{clip_id}.snr.npy` | NumPy float16 | Time-series SNR values per `snr_step_s` window |
+| `{clip_id}.c50.npy` | NumPy float16 | Time-series C50 values per `snr_step_s` window |
 
-The `.json` sidecar contains:
+The `.json` metadata contains:
 
-**Provenance** — `uid`, `clip_idx`, `clip_id`, `abs_onset`, `abs_offset`, `duration` (seconds within the source file), `source_path`, `audio_fmt`, `sample_rate`.
+**Source** — `uid`, `clip_idx`, `clip_id`, `abs_onset`, `abs_offset`, `duration`, `source_path`, `audio_fmt`, `sample_rate`.
 
-**VTC speech** — `vtc_speech_duration`, `vtc_speech_density`, `n_vtc_segments`, `mean_vtc_seg_duration`, `mean_vtc_gap`, `n_turns`, `n_labels`, `labels_present` (list of speaker types), `has_adult`, `dominant_label`, `label_durations` (seconds per type), `vad_coverage_by_label` (fraction of each VTC label also covered by VAD).
+**VTC speech** — `vtc_speech_duration`, `vtc_speech_density`, `n_vtc_segments`, `mean_vtc_seg_duration`, `mean_vtc_gap`, `n_turns`, `n_labels`, `labels_present`, `has_adult`, `dominant_label`, `label_durations`, `vad_coverage_by_label` (fraction of each VTC label also covered by VAD).
 
 **Demographics** — `child_speech_duration`, `adult_speech_duration`, `child_fraction` (share of VTC speech that is child).
 
@@ -147,11 +147,11 @@ The `.json` sidecar contains:
 
 **VAD–VTC agreement** — `vad_vtc_iou`: frame-level Intersection over Union between the two systems' masks.
 
-**SNR** *(Brouhaha; null if not run)* — `snr_mean`, `snr_std`, `snr_min`, `snr_max` (dB); `snr_step_s` (window size); `snr` (full time-series list, also stored as `.snr.npy`).
+**SNR** — `snr_mean`, `snr_std`, `snr_min`, `snr_max` (dB); `snr_step_s` (window size); `snr` (full time-series list, also stored as `.snr.npy`).
 
-**C50 clarity** *(Brouhaha; null if not run)* — `c50_mean`, `c50_std`, `c50_min`, `c50_max` (dB); `c50` (full time-series, also stored as `.c50.npy`). Higher C50 = less reverberation.
+**C50** — `c50_mean`, `c50_std`, `c50_min`, `c50_max` (dB); `c50` (full time-series, also stored as `.c50.npy`). Higher C50 = less reverberation.
 
-**Noise environment** *(PANNs; null if not run)* — `dominant_noise` (category name), `noise_profile` (dict of mean probability per category).
+**Noise environment** — `dominant_noise` (category name), `noise_profile` (dict of mean probability per category).
 
 **Segment detail** — `vad_segments` and `vtc_segments`: lists of `{onset, offset, duration}` objects with timestamps relative to the clip start. `vtc_segments` additionally carry a `label` field (FEM / MAL / KCHI / OCH).
 
@@ -186,10 +186,10 @@ VTC/
 │   │   ├── checkpoint.py    #   Checkpoint save / resume
 │   │   └── metadata.py      #   VTC metadata constructors
 │   └── plotting/            # Dashboard figure generation
-│       ├── dashboard.py     #   Orchestrator (calls sub-modules)
-│       ├── dashboard_snr.py #   SNR quality + noise environment pages
-│       ├── dashboard_speech.py # Conversation + turns pages
-│       ├── dashboard_overview.py # Overview + correlation + text summary
+│       ├── figures.py       #   Orchestrator (calls sub-modules)
+│       ├── snr_noise.py     #   SNR quality + noise environment
+│       ├── speech_turns.py  #   Conversational structure + turns
+│       └── overview.py      #   Dataset overview + correlation + text summary
 │       └── packaging.py     #   Per-clip/label summary grids
 ├── slurm/
 │   ├── pipeline.sh          # One-command pipeline orchestrator

@@ -307,7 +307,7 @@ def save_correlation_figure(
 # =========================================================================
 
 
-def print_dashboard_summary(
+def print_dataset_summary(
     dfs: dict[str, pl.DataFrame],
     tier_counts: dict[str, int],
 ) -> None:

@@ -1,10 +1,10 @@
-"""Dashboard orchestrator — renders all dashboard pages from cached DataFrames.
+"""Figure orchestrator — renders all plot pages from cached DataFrames.
 
 Sub-modules
 -----------
-- ``dashboard_snr``      — SNR & Recording Quality, Noise Environment
-- ``dashboard_speech``   — Conversational Structure, Turns & Conversations
-- ``dashboard_overview`` — Dataset Overview, Correlation, Text Summary
+- ``snr_noise``     — SNR & Recording Quality, Noise Environment
+- ``speech_turns``  — Conversational Structure, Turns & Conversations
+- ``overview``      — Dataset Overview, Correlation, Text Summary
 """
 
 from __future__ import annotations
@@ -13,21 +13,21 @@ from pathlib import Path
 
 import polars as pl
 
-from src.plotting.dashboard_overview import (
-    print_dashboard_summary,
+from src.plotting.overview import (
+    print_dataset_summary,
     save_correlation_figure,
     save_overview_figures,
 )
-from src.plotting.dashboard_snr import save_noise_figures, save_snr_figures
-from src.plotting.dashboard_speech import save_boss_figures, save_conversation_figures
+from src.plotting.snr_noise import save_noise_figures, save_snr_figures
+from src.plotting.speech_turns import save_boss_figures, save_conversation_figures
 
 
-def save_all_dashboard_figures(
+def save_all_figures(
     dfs: dict[str, pl.DataFrame],
     tier_counts: dict[str, int],
     fig_dir: Path,
 ) -> None:
-    """Render every dashboard page from cached DataFrames.
+    """Render every figure page from cached DataFrames.
 
     Parameters
     ----------
@@ -79,4 +79,4 @@ def save_all_dashboard_figures(
     print(f"\n  Dashboard: {fig_dir}/ ({n_pages} pages)")
 
     # Print text summary for log parsing
-    print_dashboard_summary(dfs, tier_counts)
+    print_dataset_summary(dfs, tier_counts)

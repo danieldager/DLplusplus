@@ -24,7 +24,7 @@ from src.core import LABEL_COLORS, VTC_LABELS
 from src.packaging.clips import CUT_TIERS, Clip, Segment, build_clips
 from src.packaging.stats import save_all_stats
 from src.packaging.writer import write_shards
-from src.plotting.dashboard import save_all_dashboard_figures
+from src.plotting.figures import save_all_figures
 from src.plotting.packaging import save_figure, save_label_figures
 from src.utils import (
     add_sample_argument,
@@ -624,7 +624,7 @@ def main() -> None:
 
     print("Rendering dashboard...", flush=True)
     t_dash = time.time()
-    save_all_dashboard_figures(dfs, global_tier_counts, fig_dir / "dashboard")
+    save_all_figures(dfs, global_tier_counts, fig_dir / "dashboard")
     print(f"  Dashboard rendered in {time.time() - t_dash:.1f}s")
 
     # --- Write shards ---
