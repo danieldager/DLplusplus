@@ -1,8 +1,7 @@
 """Speech-specific collator with masking support.
 
 :class:`SpeechCollator` pads waveforms to a uniform length, constructs
-attention masks, and optionally collates frame-level label masks generated
-by :class:`~dataloader.transform.label.MaskGenerator`.
+attention masks, and extracts metadata into batch-level tensors.
 """
 
 from __future__ import annotations
@@ -11,35 +10,40 @@ import torch
 
 from dataloader.batch.base import Collator
 from dataloader.batch.data_batch import DataBatch
-from dataloader.types import MetadataDict, SampleRate, Waveform
+from dataloader.types import MetadataDict, SampleRate, SegmentList, Waveform
 
 
 class SpeechCollator(Collator):
     """Pad and collate speech samples into a :class:`DataBatch`.
 
+    Extracts known metadata keys into batch-level tensors (``snr_db``,
+    ``durations_s``, etc.) so model code can access them directly without
+    unpacking per-sample dicts.
+
     Parameters
     ----------
     pad_to_multiple_of:
         If set, pad waveforms so that the time dimension is a multiple
-        of this value. Useful for models that require power-of-2 inputs
-        or fixed chunk sizes.
-    attention_mask_key:
-        Metadata key for a precomputed frame-level attention mask
-        (from :class:`MaskGenerator`). If present, it is collated into
-        ``DataBatch.frame_labels``.
+        of this value.
+    snr_key:
+        Metadata key for per-sample SNR in dB.
     label_mask_key:
         Metadata key for a precomputed frame-level label mask.
+    segments_key:
+        Metadata key for raw segment lists to forward to ``DataBatch``.
     """
 
     def __init__(
         self,
         pad_to_multiple_of: int | None = None,
-        attention_mask_key: str = "attention_mask",
+        snr_key: str = "snr_db",
         label_mask_key: str = "label_mask",
+        segments_key: str | None = None,
     ) -> None:
         self._pad_multiple = pad_to_multiple_of
-        self._attention_mask_key = attention_mask_key
+        self._snr_key = snr_key
         self._label_mask_key = label_mask_key
+        self._segments_key = segments_key
 
     def __call__(
         self,
@@ -65,10 +69,12 @@ class SpeechCollator(Collator):
             if remainder != 0:
                 max_len += self._pad_multiple - remainder
 
-        # Pad waveforms.
+        batch_size = len(waveforms)
         channels = waveforms[0].shape[0]
-        padded = torch.zeros(len(waveforms), channels, max_len, dtype=torch.float32)
-        attention_mask = torch.zeros(len(waveforms), max_len, dtype=torch.bool)
+
+        # ── Pad waveforms ─────────────────────────────────────────────────
+        padded = torch.zeros(batch_size, channels, max_len, dtype=torch.float32)
+        attention_mask = torch.zeros(batch_size, max_len, dtype=torch.bool)
 
         for i, (wav, length) in enumerate(zip(waveforms, lengths)):
             padded[i, :, :length] = wav
@@ -76,22 +82,63 @@ class SpeechCollator(Collator):
 
         waveform_lengths = torch.tensor(lengths, dtype=torch.long)
 
-        # Collate optional frame-level masks from metadata.
-        frame_labels = self._collate_frame_masks(
-            all_metadata, self._label_mask_key,
+        # ── Extract wav_ids ───────────────────────────────────────────────
+        wav_ids = [str(m.get("wav_id", "")) for m in all_metadata]
+
+        # ── Duration tensor ───────────────────────────────────────────────
+        durations_s = torch.tensor(
+            [l / sample_rate for l in lengths],
+            dtype=torch.float32,
         )
+
+        # ── SNR tensor ────────────────────────────────────────────────────
+        snr_db = self._collate_scalar(all_metadata, self._snr_key)
+
+        # ── Frame-level label masks ───────────────────────────────────────
+        frame_labels = self._collate_frame_masks(
+            all_metadata,
+            self._label_mask_key,
+        )
+
+        # ── Raw segments (optional) ───────────────────────────────────────
+        segments: list[SegmentList] | None = None
+        if self._segments_key:
+            segments = [
+                m.get(self._segments_key, [])  # type: ignore[misc]
+                for m in all_metadata
+            ]
 
         return DataBatch(
             waveforms=padded,
             waveform_lengths=waveform_lengths,
             sample_rate=sample_rate,
-            metadata=all_metadata,
             attention_mask=attention_mask,
+            snr_db=snr_db,
+            durations_s=durations_s,
             frame_labels=frame_labels,
+            wav_ids=wav_ids,
+            metadata=all_metadata,
+            segments=segments,
         )
 
+    # ── Helpers ───────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _collate_scalar(
+        metadata_list: list[MetadataDict],
+        key: str,
+    ) -> torch.Tensor | None:
+        """Extract a scalar float from each sample into a (B,) tensor."""
+        values = [m.get(key) for m in metadata_list]
+        if all(v is None for v in values):
+            return None
+        return torch.tensor(
+            [float(v) if v is not None else 0.0 for v in values],
+            dtype=torch.float32,
+        )
+
+    @staticmethod
     def _collate_frame_masks(
-        self,
         metadata_list: list[MetadataDict],
         key: str,
     ) -> torch.Tensor | None:
@@ -100,14 +147,18 @@ class SpeechCollator(Collator):
         if all(m is None for m in masks):
             return None
 
-        # All masks must be tensors with same number of label dimensions.
         tensors = [m for m in masks if isinstance(m, torch.Tensor)]
         if not tensors:
             return None
 
         max_frames = max(t.shape[0] for t in tensors)
         n_labels = tensors[0].shape[-1] if tensors[0].dim() > 1 else 1
-        padded = torch.zeros(len(metadata_list), max_frames, n_labels, dtype=torch.bool)
+        padded = torch.zeros(
+            len(metadata_list),
+            max_frames,
+            n_labels,
+            dtype=torch.bool,
+        )
 
         for i, m in enumerate(masks):
             if isinstance(m, torch.Tensor):

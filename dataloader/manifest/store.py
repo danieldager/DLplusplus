@@ -1,9 +1,9 @@
 """Unified metadata I/O abstraction.
 
 :class:`MetadataStore` defines a format-agnostic interface for reading and
-writing per-file metadata. Concrete backends handle Parquet, NPZ, and other
-formats behind the same API, so that downstream code (loaders, joiners) does
-not need to know how metadata is serialized.
+writing per-file metadata. Concrete backends handle Parquet, NPZ, PyTorch,
+and JSON formats behind the same API, so that downstream code (loaders,
+joiners) does not need to know how metadata is serialized.
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import polars as pl
+import torch
 
 from dataloader.types import MetadataDict, WavID
 
@@ -101,9 +102,7 @@ class ParquetStore(MetadataStore):
 
         pq_files = sorted(self._root.glob("*.parquet"))
         if not pq_files:
-            raise FileNotFoundError(
-                f"No .parquet files found in {self._root}"
-            )
+            raise FileNotFoundError(f"No .parquet files found in {self._root}")
 
         frames = [pl.read_parquet(f) for f in pq_files]
         self._cache = pl.concat(frames, how="diagonal_relaxed")
@@ -205,3 +204,37 @@ class JsonStore(MetadataStore):
 
     def list_ids(self) -> list[WavID]:
         return sorted(p.stem for p in self._root.glob("*.json"))
+
+
+class PtStore(MetadataStore):
+    """Metadata stored as per-file ``.pt`` (PyTorch) archives.
+
+    Each waveform's metadata is a single ``.pt`` file at
+    ``{root}/{wav_id}.pt``. Values are stored as-is via
+    :func:`torch.save` — tensors, numpy arrays, dicts, and scalars
+    are all supported natively.
+
+    This is the recommended backend for tensor-heavy metadata
+    (SNR arrays, noise embeddings, frame-level labels) because
+    it avoids numpy↔torch conversion overhead.
+    """
+
+    def load(self, wav_id: WavID) -> MetadataDict:
+        path = self._root / f"{wav_id}.pt"
+        if not path.is_file():
+            raise FileNotFoundError(f"No .pt file at {path}")
+        data = torch.load(path, map_location="cpu", weights_only=True)
+        if not isinstance(data, dict):
+            raise TypeError(f"Expected dict in {path}, got {type(data).__name__}")
+        return data
+
+    def save(self, wav_id: WavID, data: MetadataDict) -> None:
+        self._root.mkdir(parents=True, exist_ok=True)
+        path = self._root / f"{wav_id}.pt"
+        torch.save(data, path)
+
+    def exists(self, wav_id: WavID) -> bool:
+        return (self._root / f"{wav_id}.pt").is_file()
+
+    def list_ids(self) -> list[WavID]:
+        return sorted(p.stem for p in self._root.glob("*.pt"))

@@ -25,6 +25,7 @@ Quick Start
 from dataloader.batch.base import Collator
 from dataloader.batch.data_batch import DataBatch
 from dataloader.batch.speech import SpeechCollator
+from dataloader.dataset.webdataset import EvalSpeechDataset, WebDatasetSpeechDataset
 from dataloader.loader.base import FeatureLoader
 from dataloader.loader.metadata import MetadataLoader
 from dataloader.loader.waveform import WaveformLoader
@@ -35,12 +36,14 @@ from dataloader.manifest.store import (
     MetadataStore,
     NpzStore,
     ParquetStore,
+    PtStore,
 )
 from dataloader.processor.base import FeatureProcessor
 from dataloader.processor.registry import ProcessorRegistry
 from dataloader.transform.audio import Normalizer, Resampler, VADSegmenter
 from dataloader.transform.base import Compose, DataProcessor
 from dataloader.transform.label import LabelEncoder, MaskGenerator
+from dataloader.transform.waveform import Denoiser, WaveformProcessor
 
 __all__ = [
     # Processor
@@ -55,18 +58,24 @@ __all__ = [
     "MetadataManifest",
     "MetadataStore",
     "ParquetStore",
+    "PtStore",
     "NpzStore",
     "JsonStore",
     # Transform
     "Compose",
     "DataProcessor",
+    "Denoiser",
     "LabelEncoder",
     "MaskGenerator",
     "Normalizer",
     "Resampler",
     "VADSegmenter",
+    "WaveformProcessor",
     # Batch
     "Collator",
     "DataBatch",
     "SpeechCollator",
+    # Dataset
+    "EvalSpeechDataset",
+    "WebDatasetSpeechDataset",
 ]

@@ -2,7 +2,13 @@
 
 from dataloader.manifest.joiner import ManifestJoiner
 from dataloader.manifest.schema import MetadataManifest
-from dataloader.manifest.store import MetadataStore, NpzStore, ParquetStore
+from dataloader.manifest.store import (
+    JsonStore,
+    MetadataStore,
+    NpzStore,
+    ParquetStore,
+    PtStore,
+)
 
 __all__ = [
     "ManifestJoiner",
@@ -10,4 +16,6 @@ __all__ = [
     "MetadataStore",
     "NpzStore",
     "ParquetStore",
+    "PtStore",
+    "JsonStore",
 ]
