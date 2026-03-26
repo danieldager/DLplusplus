@@ -37,6 +37,7 @@ from dataloader.manifest.store import (
     NpzStore,
     ParquetStore,
     PtStore,
+    default_store,
 )
 from dataloader.processor.base import FeatureProcessor
 from dataloader.processor.registry import ProcessorRegistry
@@ -61,6 +62,7 @@ __all__ = [
     "PtStore",
     "NpzStore",
     "JsonStore",
+    "default_store",
     # Transform
     "Compose",
     "DataProcessor",

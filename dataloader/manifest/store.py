@@ -1,9 +1,17 @@
 """Unified metadata I/O abstraction.
 
 :class:`MetadataStore` defines a format-agnostic interface for reading and
-writing per-file metadata. Concrete backends handle Parquet, NPZ, PyTorch,
-and JSON formats behind the same API, so that downstream code (loaders,
-joiners) does not need to know how metadata is serialized.
+writing per-file metadata.
+
+**Default backend**: :class:`PtStore` (PyTorch ``.pt`` files) is the
+recommended and default format for all new metadata. It supports arbitrary
+nested dicts/tensors with zero conversion overhead and fast load times.
+
+Legacy backends (:class:`ParquetStore`, :class:`NpzStore`, :class:`JsonStore`)
+are retained for backward compatibility with existing pipeline outputs but
+should not be used for new data.
+
+Use :func:`default_store` to create a :class:`PtStore` with sensible defaults.
 """
 
 from __future__ import annotations
@@ -102,7 +110,9 @@ class ParquetStore(MetadataStore):
 
         pq_files = sorted(self._root.glob("*.parquet"))
         if not pq_files:
-            raise FileNotFoundError(f"No .parquet files found in {self._root}")
+            raise FileNotFoundError(
+                f"No .parquet files found in {self._root}"
+            )
 
         frames = [pl.read_parquet(f) for f in pq_files]
         self._cache = pl.concat(frames, how="diagonal_relaxed")
@@ -225,7 +235,9 @@ class PtStore(MetadataStore):
             raise FileNotFoundError(f"No .pt file at {path}")
         data = torch.load(path, map_location="cpu", weights_only=True)
         if not isinstance(data, dict):
-            raise TypeError(f"Expected dict in {path}, got {type(data).__name__}")
+            raise TypeError(
+                f"Expected dict in {path}, got {type(data).__name__}"
+            )
         return data
 
     def save(self, wav_id: WavID, data: MetadataDict) -> None:
@@ -238,3 +250,22 @@ class PtStore(MetadataStore):
 
     def list_ids(self) -> list[WavID]:
         return sorted(p.stem for p in self._root.glob("*.pt"))
+
+
+# ── Factory ───────────────────────────────────────────────────────────────────
+
+
+def default_store(root: Path | str) -> PtStore:
+    """Create a :class:`PtStore` — the recommended default metadata backend.
+
+    This is the preferred entry point for new code. All pipeline metadata
+    should be stored as ``.pt`` files unless there is a specific reason
+    to use another format (e.g. Parquet for manifest joins, JSON for
+    human-readable config).
+
+    Parameters
+    ----------
+    root:
+        Directory where ``.pt`` metadata files will be stored.
+    """
+    return PtStore(root)

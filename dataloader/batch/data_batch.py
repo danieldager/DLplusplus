@@ -30,7 +30,7 @@ class DataBatch:
         waveforms, waveform_lengths, sample_rate, attention_mask
 
     Metadata tensor fields (populated when available in the pipeline):
-        snr_db, durations_s, labels, label_mask, frame_labels
+        snr_db, c50_db, durations_s, labels, label_mask, frame_labels
 
     Non-tensor fields:
         metadata (list[MetadataDict]) — per-sample escape hatch
@@ -39,22 +39,23 @@ class DataBatch:
     """
 
     # ── Primary (always present) ──────────────────────────────────────────
-    waveforms: torch.Tensor  # (B, C, T_max)
-    waveform_lengths: torch.Tensor  # (B,) dtype=long
+    waveforms: torch.Tensor                         # (B, C, T_max)
+    waveform_lengths: torch.Tensor                  # (B,) dtype=long
     sample_rate: int
-    attention_mask: torch.Tensor  # (B, T_max) dtype=bool
+    attention_mask: torch.Tensor                    # (B, T_max) dtype=bool
 
     # ── Metadata tensors (populated when data exists) ─────────────────────
-    snr_db: torch.Tensor | None = None  # (B,) per-sample SNR
-    durations_s: torch.Tensor | None = None  # (B,) duration in seconds
-    labels: torch.Tensor | None = None  # (B, max_segments) dtype=long
-    label_mask: torch.Tensor | None = None  # (B, max_segments) dtype=bool
-    frame_labels: torch.Tensor | None = None  # (B, T_frames, n_labels) dtype=bool
+    snr_db: torch.Tensor | None = None              # (B,) per-sample SNR
+    c50_db: torch.Tensor | None = None              # (B,) per-sample C50 clarity
+    durations_s: torch.Tensor | None = None         # (B,) duration in seconds
+    labels: torch.Tensor | None = None              # (B, max_segments) dtype=long
+    label_mask: torch.Tensor | None = None          # (B, max_segments) dtype=bool
+    frame_labels: torch.Tensor | None = None        # (B, T_frames, n_labels) dtype=bool
 
     # ── Non-tensor fields (fallback) ──────────────────────────────────────
     wav_ids: list[str] = field(default_factory=list)  # (B,) sample identifiers
     metadata: list[MetadataDict] = field(default_factory=list)  # len B
-    segments: list[SegmentList] | None = None  # len B
+    segments: list[SegmentList] | None = None       # len B
 
     @property
     def batch_size(self) -> int:
@@ -72,6 +73,8 @@ class DataBatch:
         self.attention_mask = self.attention_mask.to(device)
         if self.snr_db is not None:
             self.snr_db = self.snr_db.to(device)
+        if self.c50_db is not None:
+            self.c50_db = self.c50_db.to(device)
         if self.durations_s is not None:
             self.durations_s = self.durations_s.to(device)
         if self.labels is not None:
@@ -91,6 +94,8 @@ class DataBatch:
         self.attention_mask = self.attention_mask.pin_memory()
         if self.snr_db is not None:
             self.snr_db = self.snr_db.pin_memory()
+        if self.c50_db is not None:
+            self.c50_db = self.c50_db.pin_memory()
         if self.durations_s is not None:
             self.durations_s = self.durations_s.pin_memory()
         if self.labels is not None:
@@ -112,6 +117,8 @@ class DataBatch:
         ]
         if self.snr_db is not None:
             fields.append("snr_db=...")
+        if self.c50_db is not None:
+            fields.append("c50_db=...")
         if self.labels is not None:
             fields.append(f"labels=({self.labels.shape})")
         if self.frame_labels is not None:

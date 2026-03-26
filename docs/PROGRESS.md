@@ -32,7 +32,7 @@
 **Rationale**: The user wants flexibility — apply transforms on-the-fly for
 experimentation, or bake them in for production. One class, two code paths.
 
-**Status**: 🔨 To implement.
+**Status**: ✅ Implemented (`dataloader/transform/waveform.py`).
 
 ### D2: Masking — Deferred (2026-03-26)
 
@@ -59,29 +59,27 @@ logic.
 
 **Status**: 🔨 To implement (compat layer is Phase 2).
 
-### D4: Storage Format — .pt as Primary, JSON for Human-Readable (2026-03-26)
+### D4: Storage Format — .pt as Primary Everywhere (2026-03-26)
 
-**Decision**: Use `.pt` (PyTorch serialization) as the primary metadata storage
-format for tensor-heavy data (SNR arrays, noise embeddings, frame-level labels).
-Keep JSON for lightweight human-readable metadata (pipeline config, provenance,
-manifest summaries).
+**Decision**: Use `.pt` (PyTorch serialization) as the **sole default** metadata
+storage format. All new metadata flows through `PtStore`. Legacy backends
+(`NpzStore`, `ParquetStore`, `JsonStore`) are retained for backward compat with
+existing pipeline outputs only.
 
 **Rationale**:
-- `.pt` is faster to load/save for tensor data than NPZ and avoids
-  numpy↔torch conversion overhead.
-- `.pt` supports arbitrary nested Python objects (dicts, lists, tensors)
-  natively.
-- Space-efficient for float32/int64 arrays vs. JSON serialization.
-- JSON stays for config/provenance because it's human-readable and
-  diffable.
+- `.pt` supports dicts, tensors, scalars, lists natively — one format for everything.
+- Avoids the pipeline having to deal with format differences.
+- `default_store(root)` factory always returns `PtStore`.
+- Parquet stays only for manifest joins (columnar data); JSON only for
+  human-readable provenance/config files written by `WaveformProcessor`.
 
 **Action items**:
-- [ ] Add `PtStore(MetadataStore)` implementation.
-- [ ] Migrate `NpzStore` usage to `PtStore` where data is tensor-native.
-- [ ] Keep `JsonStore` for config/provenance metadata.
-- [ ] Update `MetadataFormat` enum to reflect `.pt` as default.
+- [x] Add `PtStore(MetadataStore)` implementation.
+- [x] Add `default_store()` factory.
+- [x] Update `MetadataFormat` enum (`.pt` already present).
+- [ ] Migrate adapter `save()`/`load()` to use `PtStore` in Phase 2 adapters.
 
-**Status**: 🔨 To implement.
+**Status**: ✅ Implemented.
 
 ### D5: Phoneme Alignments — Deferred (2026-03-26)
 
@@ -98,11 +96,12 @@ projected into batch-level tensors wherever possible. Keep a
 `metadata: list[MetadataDict]` escape hatch for non-tensorizable data.
 
 **Action items**:
-- [ ] Add explicit tensor fields for common metadata (SNR, durations, etc.)
-- [ ] Collator populates these fields; model code reads tensors directly.
-- [ ] Keep `metadata` list for debugging / non-tensor info only.
+- [x] Add explicit tensor fields: `snr_db`, `c50_db`, `durations_s`.
+- [x] Collator populates these fields; model code reads tensors directly.
+- [x] Keep `metadata` list for debugging / non-tensor info only.
+- [x] Add `wav_ids: list[str]` for sample identification.
 
-**Status**: 🔨 To implement.
+**Status**: ✅ Implemented.
 
 ### D7: Distributed / Streaming — WebDataset IterableDataset (2026-03-26)
 
@@ -118,20 +117,28 @@ following the user's proven pattern from their token training repo:
 
 **Status**: 🔨 To implement (Phase 2–3).
 
+### D8: C50 Clarity Metric (2026-03-26)
+
+**Decision**: Add `c50_db` as a first-class tensor field in `DataBatch`
+alongside `snr_db`. Both are per-sample scalar metrics extracted by the
+Brouhaha pipeline.
+
+**Status**: ✅ Implemented.
+
 ---
 
 ## Implementation Queue (Phase 2)
 
 Priority order:
 
-1. **`PtStore`** — Add `.pt` metadata storage backend
-2. **`WaveformProcessor`** — Dual-mode (online/offline) waveform transforms
-3. **`DataBatch` refactor** — Tensor-centric fields
-4. **`dataloader/adapters/`** — Wrap VAD, VTC, SNR, Noise as `FeatureProcessor`
-5. **`PipelineManifestBuilder`** — Extract Big Join orchestration from `package.py`
-6. **Loader utilities** — Extract load functions from `package.py`
-7. **`WebDatasetSpeechDataset`** — IterableDataset with distributed support
-8. **Compat shim** — Placeholder for upstream type mapping
+1. ~~**`PtStore`** — Add `.pt` metadata storage backend~~ ✅
+2. ~~**`WaveformProcessor`** — Dual-mode (online/offline) waveform transforms~~ ✅
+3. ~~**`DataBatch` refactor** — Tensor-centric fields (`snr_db`, `c50_db`, `durations_s`, `wav_ids`)~~ ✅
+4. ~~**`WebDatasetSpeechDataset`** — IterableDataset with distributed support~~ ✅
+5. ~~**Compat shim** — Placeholder for upstream type mapping~~ ✅
+6. **`dataloader/adapters/`** — Wrap VAD, VTC, SNR, Noise as `FeatureProcessor`
+7. **`PipelineManifestBuilder`** — Extract Big Join orchestration from `package.py`
+8. **Loader utilities** — Extract load functions from `package.py`
 
 ---
 
@@ -163,13 +170,16 @@ Files created/modified as part of Dataloader++:
 | `dataloader/loader/metadata.py` | 1 | ✅ Complete |
 | `dataloader/manifest/schema.py` | 1 | ✅ Complete |
 | `dataloader/manifest/joiner.py` | 1 | ✅ Complete |
-| `dataloader/manifest/store.py` | 1 | ✅ Complete (needs PtStore) |
+| `dataloader/manifest/store.py` | 1→2 | ✅ Complete (PtStore + default_store) |
 | `dataloader/transform/base.py` | 1 | ✅ Complete |
 | `dataloader/transform/audio.py` | 1 | ✅ Complete |
 | `dataloader/transform/label.py` | 1 | ✅ Complete |
+| `dataloader/transform/waveform.py` | 2 | ✅ WaveformProcessor + Denoiser |
 | `dataloader/batch/base.py` | 1 | ✅ Complete |
-| `dataloader/batch/data_batch.py` | 1 | ✅ Complete (needs tensor refactor) |
-| `dataloader/batch/speech.py` | 1 | ✅ Complete |
+| `dataloader/batch/data_batch.py` | 1→2 | ✅ Tensor-centric (snr_db, c50_db, durations_s, wav_ids) |
+| `dataloader/batch/speech.py` | 1→2 | ✅ Collates snr_db, c50_db, durations_s |
 | `dataloader/dataset/base.py` | 1 | ✅ Complete |
-| `dataloader/dataset/webdataset.py` | 1 | ⬜ Stub only |
+| `dataloader/dataset/webdataset.py` | 2 | ✅ WebDatasetSpeechDataset + EvalSpeechDataset |
+| `dataloader/compat/__init__.py` | 2 | ✅ Created |
+| `dataloader/compat/upstream.py` | 2 | ✅ Shim (to/from upstream batch/sample) |
 | `.github/copilot-instructions.md` | 1 | ✅ Updated |

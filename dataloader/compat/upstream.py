@@ -47,6 +47,8 @@ def to_upstream_batch(batch: DataBatch) -> dict[str, Any]:
     }
     if batch.snr_db is not None:
         result["snr_db"] = batch.snr_db
+    if batch.c50_db is not None:
+        result["c50_db"] = batch.c50_db
     if batch.durations_s is not None:
         result["durations_s"] = batch.durations_s
     if batch.labels is not None:
@@ -73,6 +75,7 @@ def from_upstream_batch(data: dict[str, Any]) -> DataBatch:
         sample_rate=data["sample_rate"],
         attention_mask=data["attention_mask"],
         snr_db=data.get("snr_db"),
+        c50_db=data.get("c50_db"),
         durations_s=data.get("durations_s"),
         labels=data.get("labels"),
         label_mask=data.get("label_mask"),

@@ -8,6 +8,7 @@ from dataloader.manifest.store import (
     NpzStore,
     ParquetStore,
     PtStore,
+    default_store,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "ParquetStore",
     "PtStore",
     "JsonStore",
+    "default_store",
 ]

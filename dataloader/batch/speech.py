@@ -27,6 +27,8 @@ class SpeechCollator(Collator):
         of this value.
     snr_key:
         Metadata key for per-sample SNR in dB.
+    c50_key:
+        Metadata key for per-sample C50 clarity in dB.
     label_mask_key:
         Metadata key for a precomputed frame-level label mask.
     segments_key:
@@ -37,11 +39,13 @@ class SpeechCollator(Collator):
         self,
         pad_to_multiple_of: int | None = None,
         snr_key: str = "snr_db",
+        c50_key: str = "c50_db",
         label_mask_key: str = "label_mask",
         segments_key: str | None = None,
     ) -> None:
         self._pad_multiple = pad_to_multiple_of
         self._snr_key = snr_key
+        self._c50_key = c50_key
         self._label_mask_key = label_mask_key
         self._segments_key = segments_key
 
@@ -87,17 +91,18 @@ class SpeechCollator(Collator):
 
         # ── Duration tensor ───────────────────────────────────────────────
         durations_s = torch.tensor(
-            [l / sample_rate for l in lengths],
-            dtype=torch.float32,
+            [l / sample_rate for l in lengths], dtype=torch.float32,
         )
 
         # ── SNR tensor ────────────────────────────────────────────────────
         snr_db = self._collate_scalar(all_metadata, self._snr_key)
 
+        # ── C50 tensor ────────────────────────────────────────────────────
+        c50_db = self._collate_scalar(all_metadata, self._c50_key)
+
         # ── Frame-level label masks ───────────────────────────────────────
         frame_labels = self._collate_frame_masks(
-            all_metadata,
-            self._label_mask_key,
+            all_metadata, self._label_mask_key,
         )
 
         # ── Raw segments (optional) ───────────────────────────────────────
@@ -114,6 +119,7 @@ class SpeechCollator(Collator):
             sample_rate=sample_rate,
             attention_mask=attention_mask,
             snr_db=snr_db,
+            c50_db=c50_db,
             durations_s=durations_s,
             frame_labels=frame_labels,
             wav_ids=wav_ids,
@@ -132,10 +138,15 @@ class SpeechCollator(Collator):
         values = [m.get(key) for m in metadata_list]
         if all(v is None for v in values):
             return None
-        return torch.tensor(
-            [float(v) if v is not None else 0.0 for v in values],
-            dtype=torch.float32,
-        )
+        floats = []
+        for v in values:
+            if v is None:
+                floats.append(0.0)
+            elif isinstance(v, (int, float)):
+                floats.append(float(v))
+            else:
+                floats.append(float(str(v)))
+        return torch.tensor(floats, dtype=torch.float32)
 
     @staticmethod
     def _collate_frame_masks(
@@ -154,10 +165,7 @@ class SpeechCollator(Collator):
         max_frames = max(t.shape[0] for t in tensors)
         n_labels = tensors[0].shape[-1] if tensors[0].dim() > 1 else 1
         padded = torch.zeros(
-            len(metadata_list),
-            max_frames,
-            n_labels,
-            dtype=torch.bool,
+            len(metadata_list), max_frames, n_labels, dtype=torch.bool,
         )
 
         for i, m in enumerate(masks):
