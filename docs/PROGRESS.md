@@ -125,6 +125,68 @@ Brouhaha pipeline.
 
 **Status**: ✅ Implemented.
 
+### D9: Codebase Cleanup & Technical Debt Reduction (2026-03-27)
+
+**Decision**: Systematic cleanup before continuing Phase 2 adapters. Driven
+by an audit of all files in the repo.
+
+**Sub-decisions**:
+
+1. **Delete `archive/`** — Retired adaptive-thresholding experiment.  Zero
+   live references.  Git history preserves it.
+
+2. **Extract shared Brouhaha helpers** — `_extract_brouhaha()` and
+   `_load_brouhaha_pipeline()` are duplicated verbatim between `snr.py` and
+   `segment_snr.py`.  Extract to `src/core/brouhaha.py`.
+
+3. **Extract `resample_block()`** — Inline reimplementation in
+   `src/packaging/writer.py` duplicates `src/core/vad_processing.py`.  Move
+   the canonical function to `src/core/audio.py`, import from both sites.
+
+4. **Add resume helper to `src/utils.py`** — 5 pipeline scripts repeat the
+   same checkpoint/resume pattern.  Extract to a shared helper.
+
+5. **Move `compare.py` → `src/plotting/compare.py`** — VAD vs VTC
+   comparison is only useful for plotting/diagnostics, not production
+   inference.  Relocate and update imports in `package.py`.
+
+6. **Move `vtc_clip_alignment.py` → `src/pipeline/`** — This is a
+   production validation tool (clips must snap to the 3.98 s VTC chunk
+   grid).  The remaining `src/analysis/` scripts stay as-is for future
+   exploratory work.
+
+7. **Consolidate plotting boilerplate** — Create `src/plotting/utils.py`
+   with `lazy_pyplot()`, `save_figure()`, `hist_with_median()`.  Replace
+   6× `_setup()` copies and 8× save-figure blocks across plotting modules.
+
+8. **Break up `package.py::main()`** — Split ~400-line `main()` into named
+   functions (`_run_comparison()`, `_build_clips()`, `_compute_and_render()`,
+   `_write_shards_and_manifest()`).  Same file, no new modules.
+
+9. **Revamp plotting suite** — Many plots are exploratory leftovers.
+   Identify the essential dashboards and prune the rest.  *(Future task —
+   separate from the current cleanup.)*
+
+10. **Keep `snr.py` and `segment_snr.py` separate** — `snr.py` collects
+    full-duration SNR/C50 arrays; `segment_snr.py` collects speech-only
+    segment-level averages (used in packaging).  Both are needed.  Shared
+    Brouhaha code is extracted per item 2 above.
+
+**Status**: ✅ Complete.
+
+**D9 additional work (2026-03-28)**:
+- Moved `set_seeds()` from `src/core/vad_processing.py` → `src/utils.py`.
+  All pipeline scripts and tests updated to import from `src.utils`.
+- Updated `src/plotting/compare.py` to use `lazy_pyplot()` / `save_figure()`.
+- Extracted plotting code (~230 LOC) from `src/pipeline/vtc_clip_alignment.py`
+  into `src/plotting/clip_alignment.py`.
+- Replaced old per-topic plotting modules (overview, snr_noise, snr_vtc,
+  speech_turns, packaging) with two master dashboards in `src/plotting/master.py`.
+  Old modules moved to `archive/plotting/`.
+- `figures.py` now dispatches to `save_master_overview()` / `save_master_quality()`
+  + `print_dataset_summary()` (all in `master.py`).
+- Removed `docs/CLEANUP_PROMPTS.md` and `docs/PLOTTING_AUDIT.md` (tasks done).
+
 ---
 
 ## Implementation Queue (Phase 2)
@@ -136,9 +198,13 @@ Priority order:
 3. ~~**`DataBatch` refactor** — Tensor-centric fields (`snr_db`, `c50_db`, `durations_s`, `wav_ids`)~~ ✅
 4. ~~**`WebDatasetSpeechDataset`** — IterableDataset with distributed support~~ ✅
 5. ~~**Compat shim** — Placeholder for upstream type mapping~~ ✅
-6. **`dataloader/adapters/`** — Wrap VAD, VTC, SNR, Noise as `FeatureProcessor`
-7. **`PipelineManifestBuilder`** — Extract Big Join orchestration from `package.py`
-8. **Loader utilities** — Extract load functions from `package.py`
+6. ~~**Codebase cleanup (D9)** — DRY fixes, file moves, plotting utils, package.py decomposition~~ ✅
+7. ~~**`dataloader/adapters/`** — Wrap VAD, VTC, SNR, Noise as `FeatureProcessor`~~ ✅
+8. ~~**Config system** — `PipelineConfig` (versioned extraction params) + `FilterConfig` (load-time data selection) + `build_manifest()` convenience function~~ ✅
+9. **Loader utilities** — Extract load functions from `package.py`
+
+**Rename**: Briefly renamed `ManifestJoiner` → `FeatureJoiner`, then reverted.
+`ManifestJoiner` is correct — it joins manifests (metadata tables), not features.
 
 ---
 
@@ -155,12 +221,10 @@ Priority order:
 
 ## File Inventory
 
-Files created/modified as part of Dataloader++:
+### `dataloader/` — Dataloader++ package (Phase 1–2)
 
 | File | Phase | Status |
 |------|-------|--------|
-| `docs/DATALOADER_DESIGN.md` | 1 | ✅ Complete |
-| `docs/PROGRESS.md` | 2 | ✅ Active (this file) |
 | `dataloader/__init__.py` | 1 | ✅ Complete |
 | `dataloader/types.py` | 1 | ✅ Complete |
 | `dataloader/processor/base.py` | 1 | ✅ Complete |
@@ -182,4 +246,52 @@ Files created/modified as part of Dataloader++:
 | `dataloader/dataset/webdataset.py` | 2 | ✅ WebDatasetSpeechDataset + EvalSpeechDataset |
 | `dataloader/compat/__init__.py` | 2 | ✅ Created |
 | `dataloader/compat/upstream.py` | 2 | ✅ Shim (to/from upstream batch/sample) |
-| `.github/copilot-instructions.md` | 1 | ✅ Updated |
+| `dataloader/adapters/__init__.py` | 2 | ✅ Adapter package |
+| `dataloader/adapters/vad.py` | 2 | ✅ VADAdapter — reads vad_meta, vad_raw, vad_merged |
+| `dataloader/adapters/vtc.py` | 2 | ✅ VTCAdapter — reads vtc_meta, vtc_raw, vtc_merged |
+| `dataloader/adapters/snr.py` | 2 | ✅ SNRAdapter — reads snr_meta, snr/*.npz |
+| `dataloader/adapters/noise.py` | 2 | ✅ NoiseAdapter — reads noise_meta, noise/*.npz |
+| `dataloader/config.py` | 2 | ✅ PipelineConfig (versioned) + FilterConfig (load-time) |
+| `dataloader/build.py` | 2 | ✅ build_manifest() — Big Join + filters |
+
+### `src/` — Pipeline & shared modules (D9 cleanup)
+
+| File | Change | Status |
+|------|--------|--------|
+| `src/utils.py` | Added `set_seeds()`, `load_completed_ids()` | ✅ |
+| `src/core/brouhaha.py` | New: shared Brouhaha model loading + extraction | ✅ |
+| `src/core/audio.py` | New: `resample_block()` | ✅ |
+| `src/core/vad_processing.py` | Removed `set_seeds()` (→ utils), `resample_block()` (→ audio) | ✅ |
+| `src/plotting/utils.py` | New: `lazy_pyplot()`, `save_figure()`, `hist_with_median()` | ✅ |
+| `src/plotting/master.py` | New: 2 master dashboards + `print_dataset_summary()` | ✅ |
+| `src/plotting/clip_alignment.py` | New: extracted from vtc_clip_alignment.py | ✅ |
+| `src/plotting/figures.py` | Rewired to call master.py | ✅ |
+| `src/plotting/compare.py` | Moved from pipeline/; uses lazy_pyplot/save_figure | ✅ |
+| `src/pipeline/vtc_clip_alignment.py` | Moved from analysis/; plotting extracted | ✅ |
+| `src/pipeline/package.py` | Decomposed main() into named functions | ✅ |
+| `src/pipeline/snr.py` | Uses shared brouhaha/resume helpers | ✅ |
+| `src/pipeline/segment_snr.py` | Uses shared brouhaha/resume helpers | ✅ |
+| `src/pipeline/vad.py` | set_seeds from utils | ✅ |
+| `src/pipeline/vtc.py` | set_seeds from utils | ✅ |
+| `src/pipeline/noise.py` | set_seeds + resume from utils | ✅ |
+
+### Archived
+
+| File | Reason |
+|------|--------|
+| `archive/plotting/overview.py` | Replaced by master.py |
+| `archive/plotting/snr_noise.py` | Replaced by master.py |
+| `archive/plotting/snr_vtc.py` | Replaced by master.py |
+| `archive/plotting/speech_turns.py` | Replaced by master.py |
+| `archive/plotting/packaging.py` | Replaced by master.py |
+| `archive/CLEANUP_PROMPTS.md` | All tasks completed |
+| `archive/PLOTTING_AUDIT.md` | Audit completed |
+
+### Docs
+
+| File | Status |
+|------|--------|
+| `docs/PROGRESS.md` | ✅ Active (this file) |
+| `docs/DATALOADER_DESIGN.md` | ✅ Architecture blueprint |
+| `docs/FEATURE_EXTRACTION_SUMMARY.md` | ✅ Production reference |
+| `.github/copilot-instructions.md` | ✅ Updated |

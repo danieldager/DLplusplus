@@ -25,7 +25,7 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from src.core.vad_processing import set_seeds
+from src.utils import set_seeds
 from src.utils import get_dataset_paths, load_manifest
 
 logging.basicConfig(

@@ -21,7 +21,7 @@ from tests.conftest import _BROUHAHA_OK, requires_brouhaha
 # Guard heavy imports so the module can be *collected* on login nodes.
 if _BROUHAHA_OK:
     from src.pipeline.snr import _extract_snr
-    from src.core.vad_processing import set_seeds
+    from src.utils import set_seeds
 
 
 # ======================================================================

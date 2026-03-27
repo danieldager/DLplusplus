@@ -2,13 +2,39 @@ import argparse
 import json
 import os
 import platform
+import random
 import socket
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import numpy as np
 import polars as pl
+
+
+# ---------------------------------------------------------------------------
+# Seed helpers
+# ---------------------------------------------------------------------------
+
+
+def set_seeds(seed: int = 42) -> None:
+    """Set random seeds for reproducibility.
+
+    ``torch`` is imported lazily to avoid bloating worker processes.
+    """
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        import torch
+
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
+    except ImportError:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +487,43 @@ def load_benchmarks(step: str | None = None) -> list[dict]:
         if step is None or rec.get("step") == step:
             records.append(rec)
     return records
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint / resume helpers
+# ---------------------------------------------------------------------------
+
+
+def load_completed_ids(
+    meta_dir: Path,
+    id_column: str = "uid",
+    pattern: str = "*.parquet",
+) -> set[str]:
+    """Load IDs of already-processed files from metadata parquets.
+
+    Used for checkpoint/resume: pipeline scripts call this to discover
+    which files were completed in a previous run, then skip them.
+
+    Parameters
+    ----------
+    meta_dir : Path to directory (or single file) containing metadata.
+    id_column : Column name containing the file identifier.
+    pattern : Glob pattern for parquet files within meta_dir.
+
+    Returns
+    -------
+    Set of completed file IDs.
+    """
+    if meta_dir.is_file():
+        df = pl.read_parquet(meta_dir)
+        return set(df[id_column].to_list())
+    if not meta_dir.is_dir():
+        return set()
+    files = sorted(meta_dir.glob(pattern))
+    if not files:
+        return set()
+    df = pl.concat([pl.read_parquet(f) for f in files])
+    return set(df[id_column].to_list())
 
 
 # ---------------------------------------------------------------------------

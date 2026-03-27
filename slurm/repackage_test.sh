@@ -88,7 +88,7 @@ ALIGN_JOB=$(sbatch --parsable \
         echo \"Started: \$(date '+%Y-%m-%d %H:%M:%S')\"
 
         PYTHONUNBUFFERED=1 \\
-        uv run python -m src.analysis.vtc_clip_alignment $DATASET
+        uv run python -m src.pipeline.vtc_clip_alignment $DATASET
 
         echo \"Completed: \$(date '+%H:%M:%S')\"
     ")

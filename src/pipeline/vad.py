@@ -27,7 +27,7 @@ warnings.filterwarnings("ignore", message=".*StreamingMediaDecoder.*")
 
 from src.core.checkpoint import CKPT_META, CKPT_SEGS, clear_checkpoint
 from src.core.parallel import run_vad_parallel
-from src.core.vad_processing import set_seeds
+from src.utils import set_seeds
 from src.utils import (
     add_sample_argument,
     atomic_write_parquet,

@@ -98,6 +98,25 @@ class ProcessorRegistry:
         """Return sorted list of registered processor names."""
         return sorted(self._processors)
 
+
+# ── Default registry with built-in adapters ───────────────────────────────
+
+def default_registry() -> ProcessorRegistry:
+    """Create a :class:`ProcessorRegistry` pre-loaded with pipeline adapters.
+
+    Registers :class:`VADAdapter`, :class:`VTCAdapter`, :class:`SNRAdapter`,
+    and :class:`NoiseAdapter` so that ``registry.get("vad")`` etc. work
+    immediately.
+    """
+    from dataloader.adapters import NoiseAdapter, SNRAdapter, VADAdapter, VTCAdapter
+
+    reg = ProcessorRegistry()
+    reg.register(VADAdapter)
+    reg.register(VTCAdapter)
+    reg.register(SNRAdapter)
+    reg.register(NoiseAdapter)
+    return reg
+
     def __contains__(self, name: str) -> bool:
         return name in self._processors
 

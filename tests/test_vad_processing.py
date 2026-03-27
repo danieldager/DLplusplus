@@ -9,9 +9,9 @@ import pytest
 
 from tests.conftest import requires_tenvad
 
+from src.core.audio import resample_block
 from src.core.vad_processing import (
     get_runs,
-    resample_block,
     runs_to_segments,
     segment_stats,
     vad_error_metadata,

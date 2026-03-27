@@ -44,7 +44,7 @@ from segma.models import Models
 from segma.utils.encoders import MultiLabelEncoder
 
 from src.core.intervals import intervals_to_segments
-from src.core.vad_processing import set_seeds
+from src.utils import set_seeds
 from src.pipeline.vtc import _apply_threshold
 from src.utils import (
     atomic_write_parquet,

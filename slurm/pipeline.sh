@@ -138,7 +138,7 @@ PKG_JOB=$(sbatch --parsable \
         PYTHONUNBUFFERED=1 \\
         uv run python -m src.pipeline.package $DATASET \\
             $EXTRA_ARGS \\
-            --audio_fmt flac \\
+            --audio_fmt wav \\
             --max_clip 600
 
         echo ''

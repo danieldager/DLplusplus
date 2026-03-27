@@ -26,7 +26,8 @@ if _TORCHCODEC_OK:
     from segma.inference import apply_model_on_audio
 
 if _TENVAD_OK:
-    from src.core.vad_processing import process_vad_file, set_seeds
+    from src.core.vad_processing import process_vad_file
+    from src.utils import set_seeds
 
 
 # -----------------------------------------------------------------------
@@ -156,7 +157,7 @@ class TestVtcReproducibility:
         from segma.models import Models
         from segma.utils.encoders import MultiLabelEncoder
 
-        from src.core.vad_processing import set_seeds as _set_seeds
+        from src.utils import set_seeds as _set_seeds
 
         cfg_path = "VTC-2.0/model/config.yml"
         ckpt_path = "VTC-2.0/model/best.ckpt"

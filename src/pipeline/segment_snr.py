@@ -27,7 +27,13 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from src.core.vad_processing import set_seeds
+from src.core.brouhaha import (
+    DEFAULT_MODEL,
+    ensure_model,
+    extract_brouhaha,
+    load_brouhaha_pipeline,
+)
+from src.utils import set_seeds
 from src.utils import (
     add_sample_argument,
     get_dataset_paths,
@@ -46,7 +52,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("segment_snr")
 
-_DEFAULT_MODEL = "models/best/checkpoints/best.ckpt"
+_DEFAULT_MODEL = DEFAULT_MODEL
 
 
 def _load_vtc_segments(output_dir: Path) -> pl.DataFrame:
@@ -58,91 +64,6 @@ def _load_vtc_segments(output_dir: Path) -> pl.DataFrame:
     if not files:
         raise FileNotFoundError(f"No parquet files in {vtc_dir}")
     return pl.concat([pl.read_parquet(f) for f in files])
-
-
-def _load_brouhaha_pipeline(model_path: str, device: str):
-    """Load Brouhaha model and return the pipeline object."""
-    import io
-    import warnings
-
-    for _mod in (
-        "speechbrain",
-        "pytorch_lightning",
-        "lightning",
-        "lightning.fabric",
-        "lightning_fabric",
-    ):
-        logging.getLogger(_mod).setLevel(logging.WARNING)
-
-    from pyannote.audio import Model
-    from brouhaha.pipeline import RegressiveActivityDetectionPipeline
-
-    p = Path(model_path)
-    if not p.exists():
-        if model_path != _DEFAULT_MODEL:
-            raise FileNotFoundError(f"Brouhaha checkpoint not found: {model_path}")
-        logger.info("Brouhaha checkpoint not found — downloading from Hugging Face …")
-        from scripts.download_brouhaha import ensure_brouhaha_checkpoint
-
-        ensure_brouhaha_checkpoint(p)
-
-    logger.info(f"Model: {model_path}")
-    _real_stdout = sys.stdout
-    sys.stdout = io.StringIO()
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            model = Model.from_pretrained(Path(model_path), strict=False)
-    finally:
-        sys.stdout = _real_stdout
-
-    import torch
-
-    if model.device.type == "cpu" and device != "cpu":
-        dev = torch.device(device if torch.cuda.is_available() else "cpu")
-        model.to(dev)
-        logger.info(f"Device: {dev}")
-    else:
-        logger.info(f"Device: {model.device}")
-
-    sys.stdout = io.StringIO()
-    try:
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore")
-            pipeline = RegressiveActivityDetectionPipeline(segmentation=model)
-    finally:
-        sys.stdout = _real_stdout
-
-    warnings.filterwarnings("ignore", module=r"pyannote\.audio")
-    warnings.filterwarnings("ignore", message=".*backend.*parameter.*not used.*")
-
-    return pipeline
-
-
-def _extract_brouhaha(
-    pipeline, audio_path: Path
-) -> tuple[np.ndarray, np.ndarray, float]:
-    """Run Brouhaha on one file. Returns (raw_snr, raw_c50, step_s)."""
-    file = {"uri": audio_path.stem, "audio": str(audio_path)}
-    seg = pipeline._segmentation
-    segmentations = seg(file)
-    data = segmentations.data  # (n_frames, 3): [vad_prob, snr, c50]
-    snr = data[:, 1].astype(np.float32)
-    c50 = data[:, 2].astype(np.float32)
-
-    if hasattr(seg.model, "receptive_field"):
-        step_s = float(seg.model.receptive_field.step)
-    elif hasattr(seg.model, "introspection"):
-        step_s = float(seg.model.introspection.frames.step)
-    elif hasattr(seg, "_frames"):
-        step_s = float(seg._frames.step)
-    else:
-        import soundfile as sf
-
-        info = sf.info(str(audio_path))
-        step_s = info.duration / max(len(snr), 1)
-
-    return snr, c50, step_s
 
 
 def _segment_means(
@@ -218,7 +139,8 @@ def main(
     from src.compat import patch_torchaudio
 
     patch_torchaudio()
-    pipeline = _load_brouhaha_pipeline(model_path, device)
+    ensure_model(model_path)
+    pipeline = load_brouhaha_pipeline(model_path, device)
 
     # Resolve frame step for logging
     seg_model = pipeline._segmentation
@@ -240,7 +162,7 @@ def main(
     for i, uid in enumerate(file_ids, 1):
         audio_path = Path(uid_to_path[uid])
         try:
-            raw_snr, raw_c50, step_s = _extract_brouhaha(pipeline, audio_path)
+            _vad, raw_snr, raw_c50, step_s = extract_brouhaha(pipeline, audio_path)
 
             # Get VTC segments for this file
             file_segs = all_vtc.filter(pl.col("uid") == uid)

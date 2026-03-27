@@ -214,7 +214,7 @@ class TestExtractPanns:
         import torch
         from panns_inference import AudioTagging
 
-        from src.core.vad_processing import set_seeds
+        from src.utils import set_seeds
         set_seeds(42)
 
         dev = "cuda" if torch.cuda.is_available() else "cpu"
@@ -269,7 +269,7 @@ class TestExtractPanns:
     def test_deterministic(self, speech_clean_wav: Path):
         """Two runs with same seed should give identical results."""
         from src.pipeline.noise import extract_panns
-        from src.core.vad_processing import set_seeds
+        from src.utils import set_seeds
 
         set_seeds(42)
         p1, _ = extract_panns(self.at, speech_clean_wav, window_s=10.0)

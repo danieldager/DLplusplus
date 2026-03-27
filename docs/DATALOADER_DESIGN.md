@@ -72,11 +72,20 @@ dataloader/
 ├── README.md                   # Package documentation
 │
 ├── types.py                    # Shared type aliases and enums
+├── config.py                   # PipelineConfig + FilterConfig
+├── build.py                    # build_manifest() convenience function
 │
 ├── processor/                  # Feature Processor abstractions
 │   ├── __init__.py
 │   ├── base.py                 # FeatureProcessor ABC
 │   └── registry.py             # Processor discovery & registration
+│
+├── adapters/                   # Pipeline output adapters
+│   ├── __init__.py
+│   ├── vad.py                  # VADAdapter (reads vad_meta, vad_raw, vad_merged)
+│   ├── vtc.py                  # VTCAdapter (reads vtc_meta, vtc_raw, vtc_merged)
+│   ├── snr.py                  # SNRAdapter (reads snr_meta, snr/*.npz)
+│   └── noise.py                # NoiseAdapter (reads noise_meta, noise/*.npz)
 │
 ├── loader/                     # Feature Loader abstractions
 │   ├── __init__.py
@@ -101,6 +110,10 @@ dataloader/
 │   ├── base.py                 # Collator ABC
 │   ├── data_batch.py           # DataBatch container
 │   └── speech.py               # SpeechCollator implementation
+│
+├── compat/                     # Upstream compatibility shim
+│   ├── __init__.py
+│   └── upstream.py             # to/from upstream batch/sample
 │
 └── dataset/                    # PyTorch Dataset implementations
     ├── __init__.py
@@ -371,13 +384,78 @@ directory and import from `src/` without modifying the original code.
 ```
 dataloader/adapters/
 ├── __init__.py
-├── vad.py             # VADProcessor(FeatureProcessor)
-├── vtc.py             # VTCProcessor(FeatureProcessor)
-├── snr.py             # SNRProcessor(FeatureProcessor)
-└── noise.py           # NoiseProcessor(FeatureProcessor)
+├── vad.py             # VADAdapter(FeatureProcessor)
+├── vtc.py             # VTCAdapter(FeatureProcessor)
+├── snr.py             # SNRAdapter(FeatureProcessor)
+└── noise.py           # NoiseAdapter(FeatureProcessor)
 ```
 
-Extract the Big Join logic from `src/pipeline/package.py` into `ManifestJoiner`.
+Each adapter is **read-only**: it wraps existing pipeline outputs (parquet
+shards, ``.npz`` arrays) through the ``FeatureProcessor`` interface. The
+adapters do NOT invoke models directly — those run via SLURM. Key methods:
+
+- ``load(wav_id)`` → reads metadata + feature arrays for one file
+- ``exists(wav_id)`` → checks pipeline outputs exist and succeeded
+- ``list_ids()`` → returns all successfully processed wav_ids
+- ``as_manifest()`` → returns a Polars DataFrame with ``wav_id`` column, ready
+  for ``ManifestJoiner``
+
+Each adapter normalizes the pipeline's id column (``file_id`` or ``uid``) to
+``wav_id`` at the adapter boundary.
+
+Adapters auto-register into the ``ProcessorRegistry`` via ``default_registry()``.
+
+### 5.2 Configuration System (`config.py`)
+
+Two config types capture the user's intent:
+
+**PipelineConfig** — extraction hyperparameters. Changing any field requires
+rerunning the affected SLURM stage. Frozen dataclass with content-addressable
+``version`` hash for output directory naming. Saved as ``pipeline_config.json``
+alongside outputs.
+
+```python
+from dataloader import PipelineConfig
+
+cfg = PipelineConfig(vad_threshold=0.5, vtc_threshold=0.5)
+cfg.save("output/seedlings_1/")  # writes pipeline_config.json
+print(cfg.version)               # "0d19e22faca4"
+```
+
+**FilterConfig** — load-time data selection. Applied to the joined manifest
+(the Big Join output). Pure Polars column filtering — instant, no I/O.
+
+```python
+from dataloader import FilterConfig
+
+filters = FilterConfig(
+    min_speech_ratio=0.3,
+    min_snr_db=10.0,
+    required_labels=["KCHI"],
+    excluded_noise_categories=["music"],
+)
+```
+
+### 5.3 Manifest Builder (`build.py`)
+
+``build_manifest()`` is the main convenience function. It reads all adapters,
+joins their manifests, and applies optional filters:
+
+```python
+from dataloader import build_manifest, FilterConfig
+
+# Unfiltered — all 4 stages
+manifest = build_manifest("output/seedlings_1")
+
+# Filtered — only high-quality child speech
+manifest = build_manifest(
+    "output/seedlings_1",
+    filters=FilterConfig(min_snr_db=10.0, required_labels=["KCHI"]),
+)
+
+# Partial — only stages that have been run
+manifest = build_manifest("output/seedlings_1", stages=["vad", "vtc"])
+```
 
 ---
 

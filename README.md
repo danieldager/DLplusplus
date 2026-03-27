@@ -232,7 +232,7 @@ The `.json` metadata contains:
 
 | Module | Purpose |
 |--------|---------|
-| `src.pipeline.compare` | VAD vs VTC comparison (IoU, precision, recall, diagnostics) |
+| `src.plotting.compare` | VAD vs VTC comparison (IoU, precision, recall, diagnostics) |
 | `src.pipeline.normalize` | Standardize external manifests into `manifests/{dataset}.csv` |
 | `src.pipeline.preflight` | Estimate dataset size, GPU needs, and wall-clock time |
 | `src.pipeline.segment_snr` | Post-hoc per-VTC-segment SNR/C50 averaging |
@@ -276,9 +276,16 @@ DLplusplus/
 │       └── packaging.py     #   Per-clip/label summary grids
 ├── dataloader/              # Dataloader++ package (see Section 5)
 │   ├── types.py             #   Shared type aliases and enums
+│   ├── config.py            #   PipelineConfig + FilterConfig
+│   ├── build.py             #   build_manifest() — Big Join + filters
 │   ├── processor/           #   Feature Processor ABCs (offline extraction)
 │   │   ├── base.py          #     FeatureProcessor ABC
 │   │   └── registry.py      #     Processor discovery & registration
+│   ├── adapters/            #   Pipeline output adapters
+│   │   ├── vad.py           #     VADAdapter (reads vad_meta, vad_raw, vad_merged)
+│   │   ├── vtc.py           #     VTCAdapter (reads vtc_meta, vtc_raw, vtc_merged)
+│   │   ├── snr.py           #     SNRAdapter (reads snr_meta, snr/*.npz)
+│   │   └── noise.py         #     NoiseAdapter (reads noise_meta, noise/*.npz)
 │   ├── loader/              #   Feature Loader ABCs (waveform + metadata I/O)
 │   │   ├── base.py          #     FeatureLoader ABC
 │   │   ├── waveform.py      #     WaveformLoader

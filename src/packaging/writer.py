@@ -24,6 +24,7 @@ import numpy as np
 import soundfile as sf
 import webdataset as wds
 
+from src.core.audio import resample_block
 from src.packaging.clips import Clip
 
 
@@ -68,14 +69,9 @@ def _encode_audio(
     if data.ndim == 2:
         data = data[:, 0]
 
-    # Resample if needed (simple linear interp, same as vad_processing)
+    # Resample if needed
     if sr != target_sr:
-        n_out = int(len(data) * target_sr / sr)
-        indices = np.linspace(0, len(data) - 1, n_out)
-        lo = np.floor(indices).astype(np.int64)
-        hi = np.minimum(lo + 1, len(data) - 1)
-        frac = (indices - lo).astype(np.float32)
-        data = data[lo] * (1 - frac) + data[hi] * frac
+        data = resample_block(data, sr, target_sr)
         sr = target_sr
 
     buf = io.BytesIO()

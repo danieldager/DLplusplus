@@ -39,6 +39,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass, field
+from typing import Any
 
 import numpy as np
 
@@ -133,10 +134,9 @@ class Clip:
     # Segments (absolute coords — will be made relative at export)
     vad_segments: list[Segment] = field(default_factory=list)
     vtc_segments: list[Segment] = field(default_factory=list)
-    # Noise classification (set after clip building, from PANNs pipeline)
-    noise_array: np.ndarray | None = field(default=None, repr=False)  # (n_bins, n_cats)
-    noise_categories: list[str] = field(default_factory=list)  # category names
-    noise_step_s: float = 1.0
+    # Generic feature store — loaders attach arbitrary per-clip data here.
+    # Keys are feature names (e.g. "noise_array", "noise_categories").
+    features: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
     def duration(self) -> float:
@@ -216,14 +216,39 @@ class Clip:
             return 0.0
         return sum(s.duration for s in self.vtc_segments) / len(self.vtc_segments)
 
-    # --- Noise properties ---
+    # --- Noise properties (read from features dict) ---
+
+    @property
+    def noise_array(self) -> np.ndarray | None:
+        return self.features.get("noise_array")
+
+    @noise_array.setter
+    def noise_array(self, value: np.ndarray | None) -> None:
+        self.features["noise_array"] = value
+
+    @property
+    def noise_categories(self) -> list[str]:
+        return self.features.get("noise_categories", [])
+
+    @noise_categories.setter
+    def noise_categories(self, value: list[str]) -> None:
+        self.features["noise_categories"] = value
+
+    @property
+    def noise_step_s(self) -> float:
+        return self.features.get("noise_step_s", 1.0)
+
+    @noise_step_s.setter
+    def noise_step_s(self, value: float) -> None:
+        self.features["noise_step_s"] = value
 
     @property
     def noise_profile(self) -> dict[str, float] | None:
         """Mean probability per noise category across the clip."""
-        if self.noise_array is None or len(self.noise_array) == 0:
+        arr = self.noise_array
+        if arr is None or len(arr) == 0:
             return None
-        means = self.noise_array.mean(axis=0).astype(np.float32)
+        means = arr.mean(axis=0).astype(np.float32)
         return {cat: float(means[i]) for i, cat in enumerate(self.noise_categories)}
 
     @property
@@ -288,8 +313,14 @@ class Clip:
         return result
 
     def to_metadata(self, uid: str, clip_idx: int) -> dict:
-        """Serialise to a JSON-friendly dict with **relative** timestamps."""
-        return {
+        """Serialise to a JSON-friendly dict with **relative** timestamps.
+
+        Core fields are always present.  Feature loaders may add extra
+        keys via the ``features`` dict — any JSON-serialisable value
+        stored there under a key **not** already used by the core schema
+        is merged into the output automatically.
+        """
+        meta: dict[str, Any] = {
             "uid": uid,
             "clip_idx": clip_idx,
             "clip_id": f"{uid}_{clip_idx:04d}",
@@ -349,6 +380,15 @@ class Clip:
                 for s in self.vtc_segments
             ],
         }
+        # Merge extra features that loaders have attached.
+        # Internal keys (numpy arrays, raw loader state) are skipped;
+        # only JSON-serialisable scalars / dicts / lists are included.
+        _INTERNAL = {"noise_array", "noise_categories", "noise_step_s"}
+        for key, val in self.features.items():
+            if key in _INTERNAL or key in meta:
+                continue
+            meta[key] = val
+        return meta
 
 
 # ---------------------------------------------------------------------------

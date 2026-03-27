@@ -51,12 +51,13 @@ from src.core.metadata import (
     vtc_error_row,
     vtc_meta_row,
 )
-from src.core.vad_processing import set_seeds
+from src.utils import set_seeds
 from src.utils import (
     add_sample_argument,
     atomic_write_parquet,
     get_dataset_paths,
     hhmmss,
+    load_completed_ids,
     load_manifest,
     log_benchmark,
     merge_segments_df,
@@ -160,10 +161,7 @@ def main(
     completed_uids: set[str] = set()
 
     # Check all shard metas so a manifest reorder doesn't re-process
-    all_meta_files = sorted(meta_dir.glob("shard_*.parquet"))
-    if all_meta_files:
-        all_meta = pl.read_parquet(all_meta_files)
-        completed_uids = set(all_meta["uid"].to_list())
+    completed_uids = load_completed_ids(meta_dir, id_column="uid", pattern="shard_*.parquet")
 
     if meta_path.exists():
         prev_meta_df = pl.read_parquet(meta_path)

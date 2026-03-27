@@ -7,7 +7,6 @@ level so that each worker stays lightweight (~31 MB instead of ~500 MB).
 
 from __future__ import annotations
 
-import random
 from pathlib import Path
 
 import numpy as np
@@ -15,34 +14,12 @@ import soundfile as sf
 
 from ten_vad import TenVad
 
+from src.utils import set_seeds
+
 TARGET_SR = 16_000
 LONG_SEGMENT_THRESHOLD = 10.0  # seconds
 # 10 minutes at 16 kHz → ~19 MB peak per worker
 _BLOCK_SAMPLES = 10 * 60 * TARGET_SR  # 9_600_000 samples
-
-
-# ---------------------------------------------------------------------------
-# Seed helpers
-# ---------------------------------------------------------------------------
-
-
-def set_seeds(seed: int = 42) -> None:
-    """Set random seeds for reproducibility.
-
-    ``torch`` is imported lazily to avoid bloating worker processes.
-    """
-    random.seed(seed)
-    np.random.seed(seed)
-    try:
-        import torch
-
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
-            torch.backends.cudnn.deterministic = True
-            torch.backends.cudnn.benchmark = False
-    except ImportError:
-        pass
 
 
 # ---------------------------------------------------------------------------
@@ -100,19 +77,7 @@ def segment_stats(durations: list[float]) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def resample_block(data: np.ndarray, from_sr: int, to_sr: int) -> np.ndarray:
-    """Resample a block of int16 samples using linear interpolation.
-
-    Only called when the file sample rate differs from TARGET_SR.
-    """
-    if from_sr == to_sr:
-        return data
-    n_out = int(len(data) * to_sr / from_sr)
-    indices = np.linspace(0, len(data) - 1, n_out)
-    lo = np.floor(indices).astype(np.int64)
-    hi = np.minimum(lo + 1, len(data) - 1)
-    frac = (indices - lo).astype(np.float32)
-    return (data[lo] * (1 - frac) + data[hi] * frac).astype(np.int16)
+from src.core.audio import resample_block
 
 
 # ---------------------------------------------------------------------------

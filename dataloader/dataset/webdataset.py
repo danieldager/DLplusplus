@@ -38,7 +38,9 @@ _DEFAULT_SHUFFLE_BUFFER = 1000
 _DEFAULT_SEED = 42
 
 
-def _decode_audio(data: bytes, target_sr: int | None = None) -> tuple[Waveform, SampleRate]:
+def _decode_audio(
+    data: bytes, target_sr: int | None = None
+) -> tuple[Waveform, SampleRate]:
     """Decode audio bytes to a ``(channels, samples)`` tensor."""
     with io.BytesIO(data) as buf:
         audio, sr = sf.read(buf, dtype="float32", always_2d=True)
@@ -47,9 +49,11 @@ def _decode_audio(data: bytes, target_sr: int | None = None) -> tuple[Waveform, 
     if target_sr is not None and sr != target_sr:
         try:
             import torchaudio.functional as F
+
             waveform = F.resample(waveform, orig_freq=sr, new_freq=target_sr)
         except ImportError:
             from scipy.signal import resample as scipy_resample
+
             n_out = int(waveform.shape[-1] * target_sr / sr)
             arr = np.asarray(
                 scipy_resample(waveform.numpy(), n_out, axis=-1),
@@ -83,13 +87,24 @@ def _decode_sample(
     # Load metadata from .pt / .npy / .json keys.
     for mk in metadata_keys:
         val = sample.get(mk)
-        if val is not None:
-            # Strip extension for the metadata dict key.
-            clean_key = mk.rsplit(".", 1)[0] if "." in mk else mk
-            if isinstance(val, dict):
-                metadata.update(val)
-            else:
+        if val is None:
+            continue
+        # Strip extension for the metadata dict key.
+        clean_key = mk.rsplit(".", 1)[0] if "." in mk else mk
+        if isinstance(val, dict):
+            metadata.update(val)
+        elif mk.endswith(".json") or mk == "json":
+            import json as _json
+            try:
+                parsed = _json.loads(val)
+                if isinstance(parsed, dict):
+                    metadata.update(parsed)
+                else:
+                    metadata[clean_key] = parsed
+            except Exception:
                 metadata[clean_key] = val
+        else:
+            metadata[clean_key] = val
 
     return waveform, sr, metadata
 
@@ -120,20 +135,26 @@ class WebDatasetSpeechDataset(IterableDataset):
         Number of samples to buffer for shuffling.
     seed:
         Random seed for shard-level shuffling.
+    allowed_ids:
+        If set, only yield samples whose source ``uid`` (or ``wav_id``)
+        is in this set. Used for manifest-level filtering.
     """
 
     def __init__(
         self,
         shard_urls: list[str] | str,
-        audio_key: str = "flac",
+        audio_key: str = "wav",
         metadata_keys: list[str] | None = None,
         target_sr: SampleRate | None = None,
         processor: DataProcessor | None = None,
         shuffle_buffer: int = _DEFAULT_SHUFFLE_BUFFER,
         seed: int = _DEFAULT_SEED,
+        allowed_ids: set[str] | None = None,
     ) -> None:
         if isinstance(shard_urls, str):
-            self._urls = sorted(str(p) for p in Path(shard_urls).parent.glob(Path(shard_urls).name))
+            self._urls = sorted(
+                str(p) for p in Path(shard_urls).parent.glob(Path(shard_urls).name)
+            )
             if not self._urls:
                 self._urls = [shard_urls]
         else:
@@ -145,31 +166,38 @@ class WebDatasetSpeechDataset(IterableDataset):
         self._processor = processor
         self._shuffle_buffer = shuffle_buffer
         self._seed = seed
+        self._allowed_ids = allowed_ids
 
         random.seed(self._seed)
         random.shuffle(self._urls)
 
     def __iter__(self) -> Iterator[tuple[Waveform, SampleRate, MetadataDict]]:
-        dataset = (
-            wds.WebDataset(
-                self._urls,
-                resampled=True,
-                shardshuffle=False,
-                nodesplitter=wds.shardlists.split_by_node,
-                handler=wds.warn_and_continue,
-            )
-            .shuffle(self._shuffle_buffer)
-        )
+        dataset = wds.WebDataset(  # type: ignore
+            self._urls,
+            resampled=True,
+            shardshuffle=False,
+            nodesplitter=wds.shardlists.split_by_node,
+            handler=wds.warn_and_continue,  # type: ignore
+        ).shuffle(self._shuffle_buffer)
         dataset = dataset.compose(wds.shardlists.split_by_worker)
 
         for sample in dataset:
             result = _decode_sample(
-                sample, self._audio_key, self._metadata_keys, self._target_sr,
+                sample,
+                self._audio_key,
+                self._metadata_keys,
+                self._target_sr,
             )
             if result is None:
                 continue
 
             waveform, sr, metadata = result
+
+            # Filter by allowed source file IDs (from manifest filtering).
+            if self._allowed_ids is not None:
+                uid = metadata.get("uid", metadata.get("wav_id", ""))
+                if uid not in self._allowed_ids:
+                    continue
 
             if self._processor is not None:
                 waveform, sr, metadata = self._processor(waveform, sr, metadata)
@@ -214,7 +242,7 @@ class EvalSpeechDataset(Dataset):
         self,
         shard_urls: list[str],
         num_samples: int = 2000,
-        audio_key: str = "flac",
+        audio_key: str = "wav",
         metadata_keys: list[str] | None = None,
         target_sr: SampleRate | None = None,
         processor: DataProcessor | None = None,
@@ -233,13 +261,11 @@ class EvalSpeechDataset(Dataset):
         self._load_samples(num_samples)
 
     def _load_samples(self, num_samples: int) -> None:
-        dataset = (
-            wds.WebDataset(
-                self._urls,
-                shardshuffle=False,
-                nodesplitter=wds.shardlists.split_by_node,
-                handler=wds.warn_and_continue,
-            )
+        dataset = wds.WebDataset(  # type: ignore
+            self._urls,
+            shardshuffle=False,
+            nodesplitter=wds.shardlists.split_by_node,
+            handler=wds.warn_and_continue,  # type: ignore
         )
 
         for sample in dataset:
@@ -247,7 +273,10 @@ class EvalSpeechDataset(Dataset):
                 break
 
             result = _decode_sample(
-                sample, self._audio_key, self._metadata_keys, self._target_sr,
+                sample,
+                self._audio_key,
+                self._metadata_keys,
+                self._target_sr,
             )
             if result is None:
                 continue
@@ -262,7 +291,8 @@ class EvalSpeechDataset(Dataset):
         return len(self._samples)
 
     def __getitem__(
-        self, index: int,
+        self,
+        index: int,
     ) -> tuple[Waveform, SampleRate, MetadataDict]:
         return self._samples[index]
 
