@@ -1,0 +1,18 @@
+{
+  "dataset_dir": "output/my_dataset",
+  "pipeline": {
+    "vad_threshold": 0.5,
+    "vtc_threshold": 0.5,
+    "target_sr": 16000,
+    "audio_fmt": "wav",
+    "max_clip_s": 600
+  },
+  "filters": {
+    "min_snr_db": 10.0,
+    "required_labels": ["KCHI"]
+  },
+  "loader": {
+    "batch_size": 16,
+    "num_workers": 4
+  }
+}

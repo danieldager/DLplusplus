@@ -1,0 +1,45 @@
+[project]
+name = "dlplusplus"
+version = "0.1.0"
+description = "DL++ — Feature processing and data loading for child-centered long-form audio"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastexcel>=0.19.0",
+    "matplotlib>=3.10.6",
+    "numpy>=2.0",
+    "openpyxl>=3.1.5",
+    "polars>=1.0",
+    "pyarrow>=23.0.1",
+    "brouhaha",
+    "segma",
+    "soundfile>=0.13",
+    "ten-vad>=1.0.6.8",
+    "panns-inference>=0.1.1",
+    "webdataset>=1.0.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = ["-v", "--tb=short", "-rA", "--durations=10"]
+
+[tool.uv.sources]
+brouhaha = { git = "https://github.com/marianne-m/brouhaha-vad", rev = "1e175a9dee0f4d7c618653d64796a45405a768e1" }
+segma = { git = "https://github.com/arxaqapi/segma", rev = "ea8a54be363ef3ce15e00a7252eb637dcfaac495" }
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
+
+[tool.uv]
+override-dependencies = [
+    "torch==2.9.0",
+    "torchaudio==2.9.0",
+    "torchcodec==0.9.*",
+    "numpy>=2.0",
+    "pyannote-audio>=3.4,<4",
+]

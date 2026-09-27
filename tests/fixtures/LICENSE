@@ -1,0 +1,17 @@
+The WAV files in this directory are excerpts from LibriVox public-domain
+audiobook recordings, distributed as part of the LibriSpeech corpus.
+
+LibriVox recordings are in the public domain (https://librivox.org/pages/public-domain/).
+LibriSpeech is licensed under CC BY 4.0 (https://www.openslr.org/12).
+
+These clips (~3.6 MB total) are included solely for automated testing of
+the VTC pipeline.
+
+Source IDs (from lexical-benchmark/chunks30):
+  speech_clean.wav        3263_LibriVox_en_seq_1147    6.0s  single MAL speaker
+  speech_multi.wav        6093_LibriVox_en_seq_279    10.2s  FEM+MAL+KCHI+OCH
+  speech_sparse.wav        998_LibriVox_en_seq_537     5.8s  mostly silence
+  speech_long.wav         1586_LibriVox_en_seq_1064   27.3s  dense FEM speaker
+  speech_long_multi.wav   5563_LibriVox_en_seq_1240   62.7s  KCHI+OCH+MAL+FEM
+  silence.wav              998_LibriVox_en_seq_538     3.3s  pure silence
+  short.wav               3979_LibriVox_en_seq_189     0.3s  very short clip

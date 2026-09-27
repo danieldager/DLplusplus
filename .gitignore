@@ -1,0 +1,14 @@
+.env
+__pycache__
+
+logs
+data
+archive
+manifests
+metadata
+output
+models
+
+.pytest_cache
+.github
+*.bak
