@@ -1,17 +1,17 @@
 <h1 align="center">DL++</h1>
-<p align="center"><b>From a child's whole day of audio to a training batch, without losing the child.</b></p>
+<p align="center"><b>Feature extraction and streaming data loading for daylong child audio recordings.</b></p>
 <p align="center"><a href="pyproject.toml"><img src="https://img.shields.io/badge/python-3.13%2B-3776AB" alt="Python 3.13+"></a> <a href="tests/"><img src="https://img.shields.io/badge/tests-161%20passed-2ea44f" alt="Tests: 161 passed"></a> <a href="LICENSE"><img src="https://img.shields.io/badge/licence-MIT-2ea44f" alt="Licence: MIT"></a> <img src="https://img.shields.io/badge/status-phase%202%20of%204-8c959f" alt="Status: phase 2 of 4"></p>
 
-Children learn language from what they hear, so the lab records whole days of it: a small recorder in a vest, sixteen hours at a time, hundreds of days per corpus. Training speech models on that audio is nothing like training on audiobooks. Most of a day is silence, noise or television. The child's own voice is quiet, short and everywhere. And a generic speech detector, the first tool anyone reaches for, throws away two thirds of it. DL++ is the pipeline that turns daylong recordings into something a model can learn from: it runs four detectors over every recording in parallel on the cluster, cuts the day into clips at detected silences, writes the clips as streamable shards with forty fields of metadata each, and streams them into training with filters like "at least this quiet" or "the child must be in it". Built at the Cognitive Machine Learning lab at ENS Paris, in collaboration with Meta.
+Children learn language from what they hear, and one way to study this is to record whole days of it: a small recorder worn in a vest captures up to sixteen hours at a time, over hundreds of days per corpus. Training speech models on such recordings differs from training on read speech. Most of a day is silence, noise or television; the child's own speech is quiet, short and scattered through the day; and a general-purpose speech detector, the standard first step, discards about two thirds of it. DL++ is a pipeline that prepares daylong recordings for model training. It runs four detectors over every recording in parallel on a cluster, cuts each recording into clips at detected silences, writes the clips as streamable shards with about forty metadata fields each, and streams them into training with filters on that metadata, such as a minimum signal-to-noise ratio or the presence of the child. It was built at the Cognitive Machine Learning lab at ENS Paris, in collaboration with Meta.
 
 <p align="center"><picture><source media="(prefers-color-scheme: dark)" srcset="docs/figures/pipeline-dark.svg"><img src="docs/figures/pipeline.svg" width="100%" alt="Pipeline: a daylong recording goes through speech detection, speaker type, noise and reverb, and environmental sound in parallel, is cut at silences, written as shards with metadata, and streamed as filtered training batches"></picture></p>
 
-## The child is the hard part
+## Coverage of child speech by a generic detector
 
 <p align="center"><img src="docs/figures/vad_coverage.png" width="640" alt="Share of each speaker's speech caught by a generic speech detector"></p>
-<p align="center"><sub>A general-purpose speech detector on one corpus: it catches most adult speech and misses 67% of the child's, 93 hours out of 138. Any pipeline that starts with it has already lost the data it was built for.</sub></p>
+<p align="center"><sub>A general-purpose speech detector on one corpus. It catches most adult speech and misses 67% of the child's, 93 hours out of 138. A pipeline that starts from this detector loses most of the data it is meant to provide.</sub></p>
 
-DL++ therefore runs a speaker-type model trained on child recordings alongside the generic detector, and keeps both verdicts in the metadata. Which one to trust becomes a choice at training time, not at extraction.
+DL++ therefore runs a speaker-type model trained on child-centred recordings alongside the generic detector and records both outputs in the metadata. The choice between them is made at training time rather than at extraction.
 
 ## One corpus, end to end
 
@@ -20,33 +20,22 @@ DL++ therefore runs a speaker-type model trained on child recordings alongside t
 | daylong recordings | of audio | clips | speaker turns | of 4,643 cut points in silence | storage overhead for metadata |
 
 <p align="center"><img src="docs/figures/overview.png" width="720" alt="Hours of speech by speaker type and where the cut points fall"></p>
-<p align="center"><sub>Speech by speaker in the corpus, and where the recordings were cut. No cut was forced mid-speech: 4,636 of the 4,643 cut points sit in silence both detectors agree on, the other seven in a pause the speech detector hears.</sub></p>
+<p align="center"><sub>Speech by speaker in the corpus, and where the recordings were cut. No cut was forced mid-speech: 4,636 of the 4,643 cut points fall in silence detected by both detectors; the remaining seven fall in a pause detected by the speech detector only.</sub></p>
 
-Each clip carries its own record: who speaks and for how long, signal-to-noise ratio, reverberation, the sixteen environmental sound categories present, the turn structure. A training run selects on any of it. Seventy-seven gigabytes of source audio become seventy-nine of streamable shards plus half a gigabyte of metadata.
-
-## A four-second ghost
-
-<p align="center"><img src="docs/figures/spectrum.png" width="880" alt="Spectrum of segment lengths from the speaker-type model, with a spike at multiples of 3.985 s"></p>
-
-The speaker-type model's segments had a rhythm nobody had put there. Their lengths piled up at multiples of 3.985 seconds, sixty times above baseline at four seconds. The cause was the model's own sliding window. It is harmless on a whole file and destructive once the file is cut into clips: a clip whose start does not fall on that grid gets different predictions from the same audio.
-
-<p align="center"><img src="docs/figures/grid.png" width="640" alt="Agreement between clip-level and whole-file predictions, aligned vs misaligned"></p>
-<p align="center"><sub>Clips snapped to the model's window grid reproduce the whole-file predictions 99.6% of the time. Misaligned clips: 3.9%.</sub></p>
-
-DL++ now snaps every cut point to that grid. The fix is three lines. Finding it took reading a histogram nobody expected to be interesting.
+Each clip carries its own metadata record: speaker types and durations, signal-to-noise ratio, reverberation, the environmental sound categories present, and the turn structure. A training run can select clips on any of these fields. 77 GB of source audio become 79 GB of shards and about half a gigabyte of metadata.
 
 ## Streaming into training
 
-The loader reads shards straight from disk or object storage, splits them across nodes and workers with no duplication, applies the metadata filters, and yields padded, batched tensors. A training job never holds a recording in memory. The same shards feed [SMBS](https://github.com/danieldager/SMBS), the lab's benchmarking suite for the models trained on them.
+The loader reads shards directly from disk or object storage, distributes them across nodes and workers without duplication, applies the metadata filters, and yields padded, batched tensors. A training job never holds a full recording in memory. The same shards feed [SMBS](https://github.com/danieldager/SMBS), the lab's benchmarking suite for the models trained on them.
 
 ## Scope and credit
 
-- Built on the VTC 2.0 speaker-type model and BabyHuBERT from the LAAC lab, forked from their repository, which also provided the model figures. Cite them if you use the speaker model: Charlot, Kunze et al., [BabyHuBERT, arXiv:2509.15001](https://arxiv.org/abs/2509.15001) (BibTeX below).
+- The speaker-type model is VTC 2.0 (BabyHuBERT) from the LAAC lab; this repository is a fork of theirs and retains their model figures. Users of the speaker model should cite Charlot, Kunze et al., [BabyHuBERT, arXiv:2509.15001](https://arxiv.org/abs/2509.15001) (BibTeX below).
 - Speech detection is TenVAD; noise and reverberation are Brouhaha; environmental sound is PANNs.
 - The corpus shown is SEEDLingS, which is access-restricted. No audio, transcripts or recording identifiers are in this repository.
-- Phase 2 of 4: extraction and loading are done; curriculum sampling and multi-corpus indexing are next.
+- Phase 2 of 4: extraction and loading are complete; curriculum sampling and multi-corpus indexing are planned.
 
-## Use it
+## Usage
 
 ```bash
 git lfs install                                       # VTC-2.0 weights come from Hugging Face via git-lfs
@@ -92,4 +81,4 @@ Every step, output and metadata field is documented in [docs/REFERENCE.md](docs/
 ```
 </details>
 
-Issues and pull requests are welcome, especially from people who work with long-form recordings.
+Issues and pull requests are welcome.
